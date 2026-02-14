@@ -3,206 +3,378 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import time
 from pathlib import Path
+import sys
+import subprocess
+import re
+
 try:
     import serial
+    import serial.tools.list_ports
+    from serial.serialutil import SerialException
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pyserial"])
     import serial
-import serial.tools.list_ports
+    import serial.tools.list_ports
+    from serial.serialutil import SerialException
+
 
 # ---------- Defaults ----------
-DEFAULT_CHAR_DELAY = 0.04
-DEFAULT_LINE_DELAY = 0.20
-DEFAULT_POST_INIT_DELAY = 2.0
-DEFAULT_BYTE_DELAY = 0.02
+DEFAULT_CHAR_DELAY_S = 0.04
+DEFAULT_LINE_DELAY_S = 0.20
+DEFAULT_POST_INIT_DELAY_S = 2.0
+DEFAULT_BYTE_DELAY_S = 0.02
+
+CAS_FIXED_BASE = 0x0010  # fixed (validated)
+
+
+# ---------- X-07 key codes ----------
+KEY_ON_BREAK = 0x01
+KEY_RETURN   = 0x0D
+KEY_SPACE    = 0x20
+
+KEY_HOME     = 0x0B
+KEY_CLR      = 0x0C
+
+KEY_INS      = 0x12
+KEY_DEL      = 0x16
+
+KEY_RIGHT    = 0x1C
+KEY_LEFT     = 0x1D
+KEY_UP       = 0x1E
+KEY_DOWN     = 0x1F
 
 
 def list_serial_ports():
-    """Reliable port listing if pyserial tools available, else fallback."""
     try:
-        from serial.tools import list_ports
-        return [p.device for p in list_ports.comports()]
+        return [p.device for p in serial.tools.list_ports.comports()]
     except Exception:
-        return [f"COM{i}" for i in range(1, 41)]
+        return []
+
+
+def guess_name_in_first_16_bytes(data: bytes, fallback: str) -> str:
+    """Best-effort: try to read an ASCII-ish name from first 16 bytes."""
+    if len(data) < 0x10:
+        return fallback
+
+    txt = "".join(chr(b) if 0x20 <= b <= 0x7E else " " for b in data[:0x10])
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9 _\-\[\]]{2,24}", txt)
+    return max(tokens, key=len).strip() if tokens else fallback
+
+
+class AutoScrollFrame(ttk.Frame):
+    """
+    Scrollable frame that:
+      - shows scrollbar only when needed
+      - disables mousewheel scroll when not needed
+      - when not scrolling: stretches inner window height to canvas height
+        so the console extends to the bottom.
+    """
+    def __init__(self, master):
+        super().__init__(master)
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.scroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = ttk.Frame(self.canvas)
+
+        self.win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scroll.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scroll.pack(side="right", fill="y")
+
+        self.inner.bind("<Configure>", self._sync)
+        self.canvas.bind("<Configure>", self._sync)
+
+        self.canvas.bind_all("<MouseWheel>", self._wheel, add="+")
+        self.canvas.bind_all("<Button-4>", self._wheel_linux, add="+")
+        self.canvas.bind_all("<Button-5>", self._wheel_linux, add="+")
+
+    def _needs_scroll(self) -> bool:
+        try:
+            inner_h = self.inner.winfo_reqheight()
+            canvas_h = self.canvas.winfo_height()
+            return inner_h > canvas_h + 2
+        except Exception:
+            return False
+
+    def _sync(self, _=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self.canvas.itemconfigure(self.win, width=self.canvas.winfo_width())
+
+        if self._needs_scroll():
+            if not self.scroll.winfo_ismapped():
+                self.scroll.pack(side="right", fill="y")
+            self.canvas.itemconfigure(self.win, height=self.inner.winfo_reqheight())
+        else:
+            if self.scroll.winfo_ismapped():
+                self.scroll.pack_forget()
+            self.canvas.itemconfigure(self.win, height=max(1, self.canvas.winfo_height()))
+
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _wheel(self, event):
+        if self._needs_scroll():
+            self.canvas.yview_scroll(-int(event.delta / 120), "units")
+
+    def _wheel_linux(self, event):
+        if not self._needs_scroll():
+            return
+        self.canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
 
 
 class X07LoaderApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Canon X-07 Serial Fast Loader")
-        self.geometry("1080x760")
-        self.minsize(1020, 680)
+        self.geometry("1040x720")
+        self.minsize(920, 620)
 
+        # files
         self.basic_file: Path | None = None
         self.bin_file: Path | None = None
+        self.cas_file: Path | None = None
 
-        # Cancellation / job control
+        # job control
         self.cancel_event = threading.Event()
         self.job_lock = threading.Lock()
         self.job_running = False
 
-        self._build_ui()
+        # remote keyboard (persistent session)
+        self.remote_kbd_on = False
+        self.remote_ser: serial.Serial | None = None
 
-        # Force a proper initial refresh AFTER widgets exist
-        self.refresh_ports_btn(initial=True)
+        # widgets
+        self._transfer_controls: list[ttk.Widget] = []
+        self._always_enabled_controls: list[ttk.Widget] = []
+        self._kbd_controls: list[ttk.Widget] = []  # enabled only when REMOTE KEYBOARD ON
+
+        self._build_ui()
+        self.refresh_ports(initial=True)
         self._log_startup_banner()
 
     # ---------------- UI ----------------
     def _build_ui(self):
-        root = ttk.Frame(self, padding=10)
+        root = ttk.Frame(self, padding=6)
         root.pack(fill="both", expand=True)
 
-        # ==== SERIAL SETTINGS ====
-        settings = ttk.LabelFrame(root, text="Serial settings", padding=10)
-        settings.pack(fill="x")
+        sf = AutoScrollFrame(root)
+        sf.pack(fill="both", expand=True)
+        main = sf.inner
 
-        # No default COM port for publishing; leave empty by default
+        # ---- Serial settings ----
+        serial_box = ttk.LabelFrame(main, text="Serial settings", padding=6)
+        serial_box.pack(fill="x", pady=(0, 6))
+
         self.var_port = tk.StringVar(value="")
-        self.var_type_baud = tk.IntVar(value=4800)   # BASIC typing (8N2)
-        self.var_xfer_baud = tk.IntVar(value=8000)   # transfer (7E1)
+        self.var_typing_baud = tk.IntVar(value=4800)   # 8N2
+        self.var_xfer_baud = tk.IntVar(value=8000)     # 7E1
 
-        self.var_char_delay = tk.DoubleVar(value=DEFAULT_CHAR_DELAY)
-        self.var_line_delay = tk.DoubleVar(value=DEFAULT_LINE_DELAY)
-        self.var_post_init_delay = tk.DoubleVar(value=DEFAULT_POST_INIT_DELAY)
-        self.var_byte_delay = tk.DoubleVar(value=DEFAULT_BYTE_DELAY)
+        self.var_char = tk.DoubleVar(value=DEFAULT_CHAR_DELAY_S)
+        self.var_line = tk.DoubleVar(value=DEFAULT_LINE_DELAY_S)
+        self.var_post = tk.DoubleVar(value=DEFAULT_POST_INIT_DELAY_S)
+        self.var_byte = tk.DoubleVar(value=DEFAULT_BYTE_DELAY_S)
 
-        row0 = ttk.Frame(settings)
-        row0.pack(fill="x")
+        r = ttk.Frame(serial_box)
+        r.pack(fill="x")
 
-        ttk.Label(row0, text="COM port:").pack(side="left")
-        self.cbo_port = ttk.Combobox(row0, textvariable=self.var_port, width=12, state="readonly")
-        self.cbo_port.pack(side="left", padx=(6, 8))
+        ttk.Label(r, text="COM:").pack(side="left")
+        self.cbo_port = ttk.Combobox(r, textvariable=self.var_port, width=10, state="readonly")
+        self.cbo_port.pack(side="left", padx=(4, 6))
 
-        ttk.Button(row0, text="Refresh", command=self.refresh_ports_btn).pack(side="left", padx=(0, 16))
+        btn_refresh = ttk.Button(r, text="Refresh", command=self.refresh_ports)
+        btn_refresh.pack(side="left", padx=(0, 10))
+        self._always_enabled_controls.append(btn_refresh)
 
-        ttk.Label(row0, text="Typing baud (8N2):").pack(side="left")
-        ttk.Entry(row0, textvariable=self.var_type_baud, width=8).pack(side="left", padx=(6, 16))
+        ttk.Label(r, text="Typing baud (8N2):").pack(side="left")
+        ttk.Entry(r, textvariable=self.var_typing_baud, width=7).pack(side="left", padx=(4, 10))
 
-        ttk.Label(row0, text="Transfer baud (7E1):").pack(side="left")
-        ttk.Entry(row0, textvariable=self.var_xfer_baud, width=8).pack(side="left", padx=(6, 16))
+        ttk.Label(r, text="Xfer baud (7E1):").pack(side="left")
+        ttk.Entry(r, textvariable=self.var_xfer_baud, width=7).pack(side="left", padx=(4, 10))
 
-        row1 = ttk.Frame(settings)
-        row1.pack(fill="x", pady=(10, 0))
+        ttk.Label(r, text="CHAR(s):").pack(side="left")
+        ttk.Entry(r, textvariable=self.var_char, width=6).pack(side="left", padx=(3, 8))
+        ttk.Label(r, text="LINE(s):").pack(side="left")
+        ttk.Entry(r, textvariable=self.var_line, width=6).pack(side="left", padx=(3, 8))
+        ttk.Label(r, text="PostINIT(s):").pack(side="left")
+        ttk.Entry(r, textvariable=self.var_post, width=6).pack(side="left", padx=(3, 8))
+        ttk.Label(r, text="Byte(s):").pack(side="left")
+        ttk.Entry(r, textvariable=self.var_byte, width=6).pack(side="left", padx=(3, 0))
 
-        ttk.Label(row1, text="CHAR_DELAY:").pack(side="left")
-        ttk.Entry(row1, textvariable=self.var_char_delay, width=7).pack(side="left", padx=(6, 14))
-        ttk.Label(row1, text="LINE_DELAY:").pack(side="left")
-        ttk.Entry(row1, textvariable=self.var_line_delay, width=7).pack(side="left", padx=(6, 14))
-        ttk.Label(row1, text="Post INIT wait (s):").pack(side="left")
-        ttk.Entry(row1, textvariable=self.var_post_init_delay, width=7).pack(side="left", padx=(6, 14))
-        ttk.Label(row1, text="Byte delay (s):").pack(side="left")
-        ttk.Entry(row1, textvariable=self.var_byte_delay, width=7).pack(side="left", padx=(6, 14))
-
-        # Cancel button (global)
-        row_cancel = ttk.Frame(settings)
-        row_cancel.pack(fill="x", pady=(10, 0))
-        self.btn_cancel = ttk.Button(row_cancel, text="Cancel current transfer", command=self.cancel_current, state="disabled")
+        # cancel/disable slave row
+        r2 = ttk.Frame(serial_box)
+        r2.pack(fill="x", pady=(4, 0))
+        self.btn_cancel = ttk.Button(r2, text="Cancel transfer", command=self.cancel_current, state="disabled")
         self.btn_cancel.pack(side="left")
-        ttk.Label(row_cancel, text="(Stops BASIC/ASM sending loops safely)").pack(side="left", padx=(10, 0))
 
-        # ==== BASIC ====
-        files = ttk.LabelFrame(root, text="BASIC program (.txt)", padding=10)
-        files.pack(fill="x", pady=(10, 0))
+        btn_disable_slave = ttk.Button(r2, text="Disable slave (EXEC&HEE33)", command=self.disable_slave_mode)
+        btn_disable_slave.pack(side="left", padx=(6, 0))
+        self._transfer_controls.append(btn_disable_slave)
 
-        self.lbl_basic = ttk.Label(files, text="Selected BASIC: (none)")
+        ttk.Label(
+            r2,
+            text='Note: BASIC TXT, ASM and REMOTE KEYBOARD use SLAVE mode (INIT#5,"COM:" then EXEC&HEE1F).',
+        ).pack(side="left", padx=(10, 0))
+
+        # ---- BASIC ----
+        basic_box = ttk.LabelFrame(main, text="BASIC", padding=6)
+        basic_box.pack(fill="x", pady=(0, 6))
+        cols = ttk.Frame(basic_box)
+        cols.pack(fill="x")
+        left = ttk.Frame(cols)
+        right = ttk.Frame(cols)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        # CAS/K7 (LEFT)
+        cas = ttk.LabelFrame(left, text='Cassette stream (.cas/.k7) via LOAD "COM:" (raw bytes)', padding=6)
+        cas.pack(fill="both", expand=True)
+
+        self.lbl_cas = ttk.Label(cas, text="Selected CAS/K7: (none)")
+        self.lbl_cas.pack(anchor="w")
+
+        rc = ttk.Frame(cas); rc.pack(fill="x", pady=(4, 0))
+        btn_pick_cas = ttk.Button(rc, text="Select .cas/.k7…", command=self.pick_cas)
+        btn_pick_cas.pack(side="left")
+        self._transfer_controls.append(btn_pick_cas)
+
+        btn_inspect = ttk.Button(rc, text="Inspect header", command=self.inspect_cas_header)
+        btn_inspect.pack(side="left", padx=(6, 0))
+        self._always_enabled_controls.append(btn_inspect)
+
+        btn_send_cas = ttk.Button(rc, text="Send raw stream", command=self.send_cas_raw)
+        btn_send_cas.pack(side="left", padx=(6, 0))
+        self._transfer_controls.append(btn_send_cas)
+
+        ttk.Label(rc, text='(X-07: LOAD"COM:" then RETURN)').pack(side="left", padx=(10, 0))
+        ttk.Label(cas, text="Fixed send base: 0x0010 (validated).").pack(anchor="w", pady=(4, 0))
+
+        # TXT/BAS (RIGHT)
+        txt = ttk.LabelFrame(right, text="Text listing (.txt/.bas) via SLAVE mode", padding=6)
+        txt.pack(fill="both", expand=True)
+
+        self.lbl_basic = ttk.Label(txt, text="Selected BASIC: (none)")
         self.lbl_basic.pack(anchor="w")
 
-        rowb = ttk.Frame(files)
-        rowb.pack(fill="x", pady=(6, 4))
-        ttk.Button(rowb, text="Select BASIC .txt…", command=self.pick_basic).pack(side="left")
-        ttk.Button(rowb, text="Send BASIC (.txt)", command=self.send_basic_file).pack(side="left", padx=(10, 0))
-        ttk.Button(rowb, text="Disable slave mode (EXEC&HEE33)", command=self.disable_slave_mode).pack(side="left", padx=(10, 0))
+        rb = ttk.Frame(txt); rb.pack(fill="x", pady=(4, 0))
+        btn_pick_basic = ttk.Button(rb, text="Select .txt/.bas…", command=self.pick_basic)
+        btn_pick_basic.pack(side="left")
+        self._transfer_controls.append(btn_pick_basic)
 
-        # BASIC progress
-        self.basic_prog_var = tk.DoubleVar(value=0)
-        self.basic_prog = ttk.Progressbar(files, variable=self.basic_prog_var, maximum=100, mode="determinate")
-        self.basic_prog.pack(fill="x", pady=(6, 0))
-        self.basic_prog_label = ttk.Label(files, text="BASIC progress: idle")
-        self.basic_prog_label.pack(anchor="w", pady=(2, 0))
+        btn_send_basic = ttk.Button(rb, text="Send BASIC", command=self.send_basic_file)
+        btn_send_basic.pack(side="left", padx=(6, 0))
+        self._transfer_controls.append(btn_send_basic)
 
-        # ==== FAST LOADER + ASM ====
-        xfer = ttk.LabelFrame(root, text="Fast loader + ASM transfer", padding=10)
-        xfer.pack(fill="x", pady=(10, 0))
+        # ---- ASM ----
+        asm = ttk.LabelFrame(main, text="ASM via SLAVE mode", padding=6)
+        asm.pack(fill="x", pady=(0, 6))
 
         self.var_addr = tk.StringVar(value="0x1000")
         self.var_append_run = tk.BooleanVar(value=True)
 
-        # --- Requested layout order ---
-        # 1) file selector first (with filename shown above)
-        self.lbl_bin = ttk.Label(xfer, text="Selected ASM binary (.bin): (none)")
+        self.lbl_bin = ttk.Label(asm, text="Selected ASM binary: (none)")
         self.lbl_bin.pack(anchor="w")
 
-        rowbin = ttk.Frame(xfer)
-        rowbin.pack(fill="x", pady=(6, 4))
-        ttk.Button(rowbin, text="Select bin…", command=self.pick_bin).pack(side="left")
+        ra = ttk.Frame(asm); ra.pack(fill="x", pady=(4, 0))
+        btn_pick_bin = ttk.Button(ra, text="Select bin…", command=self.pick_bin)
+        btn_pick_bin.pack(side="left")
+        self._transfer_controls.append(btn_pick_bin)
 
-        # 2) load address
-        ttk.Label(rowbin, text="Load address (hex):").pack(side="left", padx=(18, 6))
-        ttk.Entry(rowbin, textvariable=self.var_addr, width=10).pack(side="left")
+        ttk.Label(ra, text="Load addr:").pack(side="left", padx=(10, 4))
+        ttk.Entry(ra, textvariable=self.var_addr, width=10).pack(side="left")
 
-        # 3) send loader
-        rowl = ttk.Frame(xfer)
-        rowl.pack(fill="x", pady=(8, 0))
-        ttk.Button(rowl, text="Send BASIC fast loader", command=self.send_fast_loader).pack(side="left")
+        btn_send_loader = ttk.Button(ra, text="Send BASIC fast loader", command=self.send_fast_loader)
+        btn_send_loader.pack(side="left", padx=(10, 0))
+        self._transfer_controls.append(btn_send_loader)
 
-        # 4) append RUN checkbox
-        ttk.Checkbutton(rowl, text="Append RUN (auto start loader)", variable=self.var_append_run).pack(side="left", padx=(14, 0))
+        ttk.Checkbutton(ra, text="Append RUN", variable=self.var_append_run).pack(side="left", padx=(8, 0))
 
-        # 5) send ASM / one-click
-        rowbtn = ttk.Frame(xfer)
-        rowbtn.pack(fill="x", pady=(8, 0))
-        ttk.Button(rowbtn, text="Send ASM binary (expects BASIC loader running)", command=self.send_bin_only).pack(side="left")
-        ttk.Button(rowbtn, text="Send fast loader + ASM (one click)", command=self.send_loader_and_bin).pack(side="left", padx=(14, 0))
+        btn_send_asm = ttk.Button(ra, text="Send ASM (loader running)", command=self.send_bin_only)
+        btn_send_asm.pack(side="left", padx=(10, 0))
+        self._transfer_controls.append(btn_send_asm)
 
-        # ASM progress
-        self.asm_prog_var = tk.DoubleVar(value=0)
-        self.asm_prog = ttk.Progressbar(xfer, variable=self.asm_prog_var, maximum=100, mode="determinate")
-        self.asm_prog.pack(fill="x", pady=(10, 0))
-        self.asm_prog_label = ttk.Label(xfer, text="ASM progress: idle")
-        self.asm_prog_label.pack(anchor="w", pady=(2, 0))
+        btn_one_click = ttk.Button(ra, text="One click: loader + ASM", command=self.send_loader_and_bin)
+        btn_one_click.pack(side="left", padx=(10, 0))
+        self._transfer_controls.append(btn_one_click)
 
-        # Status line
+        # ---- Remote keyboard ----
+        kbd = ttk.LabelFrame(main, text='Remote keyboard via SLAVE mode (PC -> X-07)', padding=6)
+        kbd.pack(fill="x", pady=(0, 6))
+
+        rk = ttk.Frame(kbd); rk.pack(fill="x")
+        self.btn_remote_toggle = ttk.Button(rk, text="REMOTE KEYBOARD: OFF", command=self.toggle_remote_keyboard)
+        self.btn_remote_toggle.pack(side="left")
+        self._always_enabled_controls.append(self.btn_remote_toggle)
+
+        ttk.Label(rk, text='(requires SLAVE mode: INIT#5,"COM:" then EXEC&HEE1F)').pack(side="left", padx=(10, 0))
+
+        row_btns = ttk.Frame(kbd); row_btns.pack(fill="x", pady=(6, 0))
+
+        def kbtn(label: str, cmd, width=6):
+            b = ttk.Button(row_btns, text=label, width=width, command=cmd)
+            b.pack(side="left", padx=(2, 0))
+            self._kbd_controls.append(b)
+            return b
+
+        # Buttons: codes
+        kbtn("HOME",  lambda: self._kbd_send_byte(KEY_HOME))
+        kbtn("CLR",   lambda: self._kbd_send_byte(KEY_CLR), width=5)
+        kbtn("INS",   lambda: self._kbd_send_byte(KEY_INS), width=5)
+        kbtn("DEL",   lambda: self._kbd_send_byte(KEY_DEL), width=5)
+        kbtn("BREAK", lambda: self._kbd_send_byte(KEY_ON_BREAK), width=6)
+
+        ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        # Macros
+        def macro(label: str, text: str, w=4):
+            b = ttk.Button(row_btns, text=label, width=w, command=lambda: self._kbd_send_bytes(text.encode("ascii", errors="replace")))
+            b.pack(side="left", padx=(2, 0))
+            self._kbd_controls.append(b)
+
+        macro("F1",  "?TIME$\r")
+        macro("F2",  'CLOAD"\r')
+        macro("F3",  "LOCATE ")
+        macro("F4",  "LIST ")
+        macro("F5",  "RUN\r")
+        macro("F6",  "?DATE$\r")
+        macro("F7",  'CSAVE"\r')
+        macro("F8",  "PRINT ")
+        macro("F9",  "SLEEP")
+        macro("F10", "CONT\r", w=5)
+
+        ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        # Arrows (same line)
+        kbtn("←", lambda: self._kbd_send_byte(KEY_LEFT), width=3)
+        kbtn("↑", lambda: self._kbd_send_byte(KEY_UP), width=3)
+        kbtn("↓", lambda: self._kbd_send_byte(KEY_DOWN), width=3)
+        kbtn("→", lambda: self._kbd_send_byte(KEY_RIGHT), width=3)
+
+        ttk.Label(kbd, text="Type here (sent to X-07 while REMOTE KEYBOARD is ON):").pack(anchor="w", pady=(6, 0))
+        self.relay_box = tk.Text(kbd, height=3, wrap="none")
+        self.relay_box.pack(fill="x", expand=False)
+        self.relay_box.bind("<KeyPress>", self._on_remote_keypress)
+        self._kbd_controls.append(self.relay_box)
+
+        # ---- Common progress + Console ----
+        bottom = ttk.LabelFrame(main, text="Progress / Console", padding=6)
+        bottom.pack(fill="both", expand=True, pady=(0, 0))
+
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress = ttk.Progressbar(bottom, variable=self.progress_var, maximum=100)
+        self.progress.pack(fill="x")
+        self.progress_label = ttk.Label(bottom, text="Progress: idle")
+        self.progress_label.pack(anchor="w", pady=(2, 0))
+
         self.status_var = tk.StringVar(value="Status: idle")
-        ttk.Label(root, textvariable=self.status_var).pack(anchor="w", pady=(10, 0))
+        ttk.Label(bottom, textvariable=self.status_var).pack(anchor="w")
 
-        # ==== CONSOLE ====
-        console = ttk.LabelFrame(root, text="Console", padding=10)
-        console.pack(fill="both", expand=True, pady=(10, 0))
+        self.txt = tk.Text(bottom, height=12, wrap="word")
+        self.txt.pack(fill="both", expand=True, pady=(4, 0))
 
-        self.txt = tk.Text(console, height=16, wrap="word")
-        self.txt.pack(fill="both", expand=True, side="left")
-        scroll = ttk.Scrollbar(console, command=self.txt.yview)
-        scroll.pack(fill="y", side="right")
-        self.txt.configure(yscrollcommand=scroll.set)
-
-    # ---------------- Ports ----------------
-    def refresh_ports_btn(self, initial=False):
-        ports = list_serial_ports()
-        self.cbo_port["values"] = ports
-
-        current = (self.var_port.get() or "").strip()
-        if current and current in ports:
-            # keep user selection
-            self.var_port.set(current)
-        else:
-            # no default selection; for initial load keep empty if possible
-            if initial:
-                self.var_port.set("")
-            else:
-                # if user hit refresh and their selection disappeared, leave blank
-                self.var_port.set("")
-
-        if not initial:
-            self.log("[INFO] COM ports refreshed.")
-        else:
-            if ports:
-                self.log(f"[INFO] COM ports loaded: {', '.join(ports[:10])}{'...' if len(ports) > 10 else ''}")
-            else:
-                self.log("[WARN] No COM ports detected. Plug your USB-serial adapter and click Refresh.")
+        # Start with keyboard controls disabled (OFF)
+        self._set_keyboard_controls_enabled(False)
 
     # ---------------- Logging ----------------
     def _ts(self) -> str:
-        # Always local time: [hh:mm:ss]
         return time.strftime("[%H:%M:%S]")
 
     def log(self, msg: str):
@@ -212,44 +384,55 @@ class X07LoaderApp(tk.Tk):
 
     def _log_startup_banner(self):
         self.log("Canon X-07 Serial Fast Loader - ready.")
-        self.log("")
-        self.log("=== IMPORTANT (Slave mode reminders) ===")
-        self.log("Enter slave mode (minimal typing):")
-        self.log('  INIT#5,"COM:')
-        self.log('  EXEC&HEE1F')
-        self.log("Disable slave mode (remote):")
-        self.log("  EXEC&HEE33")
-        self.log("---------------------------------------")
-        self.log("This tool types BASIC in 8N2, then switches PC side to 7E1 for fast transfer (mode 'G').")
+        self.log('SLAVE mode (BASIC TXT + ASM + REMOTE KEYBOARD): INIT#5,"COM:" then EXEC&HEE1F (user guide p.119).')
+        self.log('CAS/K7 raw stream: use LOAD"COM:" on X-07, then send raw bytes from PC.')
+        self.log("Exit slave: EXEC&HEE33 (remote) or power cycle.")
         self.log("")
 
-    # ---------------- File pickers ----------------
-    def pick_basic(self):
-        p = filedialog.askopenfilename(
-            title="Select BASIC program (.txt)",
-            filetypes=[("Text file", "*.txt"), ("All files", "*.*")]
-        )
-        if not p:
-            return
-        self.basic_file = Path(p)
-        self.lbl_basic.config(text=f"Selected BASIC: {self.basic_file}")
-        self.log(f"[OK] BASIC selected: {self.basic_file}")
+    # ---------------- UI enabling/disabling ----------------
+    def _set_controls_enabled(self, enabled: bool):
+        for w in self._transfer_controls:
+            try:
+                w.configure(state=("normal" if enabled else "disabled"))
+            except Exception:
+                pass
+        for w in self._always_enabled_controls:
+            try:
+                w.configure(state="normal")
+            except Exception:
+                pass
 
-    def pick_bin(self):
-        p = filedialog.askopenfilename(
-            title="Select ASM binary (.bin)",
-            filetypes=[("Binary", "*.bin"), ("All files", "*.*")]
-        )
-        if not p:
-            return
-        self.bin_file = Path(p)
-        self.lbl_bin.config(text=f"Selected ASM binary (.bin): {self.bin_file}")
-        self.log(f"[OK] BIN selected: {self.bin_file}")
+    def _set_keyboard_controls_enabled(self, enabled: bool):
+        for w in self._kbd_controls:
+            try:
+                if isinstance(w, tk.Text):
+                    w.configure(state=("normal" if enabled else "disabled"))
+                else:
+                    w.configure(state=("normal" if enabled else "disabled"))
+            except Exception:
+                pass
 
-    # ---------------- Cancellation ----------------
+    # ---------------- Ports ----------------
+    def refresh_ports(self, initial=False):
+        ports = list_serial_ports()
+        self.cbo_port["values"] = ports
+        cur = (self.var_port.get() or "").strip()
+        if cur in ports:
+            self.var_port.set(cur)
+        else:
+            self.var_port.set(ports[0] if ports else "")
+        if initial:
+            if ports:
+                self.log(f"[INFO] COM ports loaded: {', '.join(ports[:10])}{'...' if len(ports) > 10 else ''}")
+            else:
+                self.log("[WARN] No COM ports detected. Plug adapter and click Refresh.")
+        else:
+            self.log("[INFO] COM ports refreshed.")
+
+    # ---------------- Job control ----------------
     def cancel_current(self):
         self.cancel_event.set()
-        self.log("[WARN] Cancel requested by user...")
+        self.log("[WARN] Cancel requested...")
 
     def _job_start(self):
         with self.job_lock:
@@ -257,76 +440,32 @@ class X07LoaderApp(tk.Tk):
                 raise RuntimeError("A transfer is already running. Cancel it first.")
             self.job_running = True
         self.cancel_event.clear()
+
+        # Disable remote keyboard during transfers
+        if self.remote_kbd_on:
+            self._remote_keyboard_off(reason="[WARN] Remote keyboard disabled during transfer.")
+
         self.after(0, lambda: self.btn_cancel.config(state="normal"))
+        self.after(0, lambda: self._set_controls_enabled(False))
+        self.after(0, lambda: self._set_keyboard_controls_enabled(False))
 
     def _job_end(self):
         with self.job_lock:
             self.job_running = False
         self.after(0, lambda: self.btn_cancel.config(state="disabled"))
+        self.after(0, lambda: self._set_controls_enabled(True))
+        # remote keyboard remains OFF after a transfer (safe)
+        self.after(0, lambda: self._set_keyboard_controls_enabled(False))
 
-    # ---------------- Progress helpers (thread-safe via after) ----------------
     def _set_status(self, text: str):
         self.after(0, lambda: self.status_var.set(f"Status: {text}"))
 
-    def _set_basic_progress(self, pct: float, label: str):
+    def _set_progress(self, pct: float, label: str):
         def _u():
-            self.basic_prog_var.set(max(0.0, min(100.0, pct)))
-            self.basic_prog_label.config(text=f"BASIC progress: {label}")
+            self.progress_var.set(max(0.0, min(100.0, pct)))
+            self.progress_label.config(text=f"Progress: {label}")
         self.after(0, _u)
 
-    def _set_asm_progress(self, pct: float, label: str):
-        def _u():
-            self.asm_prog_var.set(max(0.0, min(100.0, pct)))
-            self.asm_prog_label.config(text=f"ASM progress: {label}")
-        self.after(0, _u)
-
-    # ---------------- Serial helpers ----------------
-    def _require_port(self) -> str:
-        p = (self.var_port.get() or "").strip()
-        if not p:
-            raise RuntimeError("No COM port selected. Choose a port in 'Serial settings'.")
-        return p
-
-    def _open_for_typing(self) -> serial.Serial:
-        # BASIC typing: 8N2
-        port = self._require_port()
-        return serial.Serial(
-            port,
-            int(self.var_type_baud.get()),
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_TWO,
-            timeout=0.2,
-            write_timeout=1.0
-        )
-
-    def _switch_to_xfer(self, ser: serial.Serial):
-        # Transfer: 7E1
-        ser.baudrate = int(self.var_xfer_baud.get())
-        ser.bytesize = serial.SEVENBITS
-        ser.parity = serial.PARITY_EVEN
-        ser.stopbits = serial.STOPBITS_ONE
-
-    def _parse_addr(self) -> int:
-        s = self.var_addr.get().strip().lower()
-        if s.endswith("h"):
-            return int(s[:-1], 16)
-        return int(s, 0)
-
-    def _type_line(self, ser: serial.Serial, line: str):
-        char_delay = float(self.var_char_delay.get())
-        line_delay = float(self.var_line_delay.get())
-        for ch in line.encode("ascii", errors="replace"):
-            if self.cancel_event.is_set():
-                raise InterruptedError("Cancelled during BASIC typing.")
-            ser.write(bytes([ch]))
-            ser.flush()
-            time.sleep(char_delay)
-        ser.write(b"\r")
-        ser.flush()
-        time.sleep(line_delay)
-
-    # ---------------- Thread wrapper ----------------
     def _run_threaded(self, fn, name: str):
         def runner():
             try:
@@ -342,49 +481,140 @@ class X07LoaderApp(tk.Tk):
                 messagebox.showerror("Error", f"{name}\n\n{e!r}")
             finally:
                 self._set_status("idle")
+                self._set_progress(0, "idle")
                 self._job_end()
         threading.Thread(target=runner, daemon=True).start()
 
-    # ---------------- Actions ----------------
-    def send_basic_file(self):
-        if not self.basic_file or not self.basic_file.exists():
-            messagebox.showwarning("Missing BASIC", "Please select a BASIC .txt file first.")
-            return
-        self._run_threaded(self._send_basic_file_impl, "Send BASIC (.txt)")
+    # ---------------- Serial helpers ----------------
+    def _require_port(self) -> str:
+        p = (self.var_port.get() or "").strip()
+        if not p:
+            raise RuntimeError("No COM port selected.")
+        return p
 
-    def _send_basic_file_impl(self):
-        self._set_status("typing BASIC (.txt)")
-        self._set_basic_progress(0, "starting...")
+    def _open_for_typing(self) -> serial.Serial:
+        # BASIC typing / CAS raw / remote keyboard: 8N2
+        return serial.Serial(
+            self._require_port(),
+            int(self.var_typing_baud.get()),
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_TWO,
+            timeout=0.2,
+            write_timeout=2.0
+        )
 
-        lines = self.basic_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        lines = [ln.rstrip("\r\n") for ln in lines if ln.strip() != ""]
-        total = max(1, len(lines) + 1)  # +1 for EXEC&HEE33
+    def _switch_to_xfer(self, ser: serial.Serial):
+        # ASM xfer: 7E1
+        ser.baudrate = int(self.var_xfer_baud.get())
+        ser.bytesize = serial.SEVENBITS
+        ser.parity = serial.PARITY_EVEN
+        ser.stopbits = serial.STOPBITS_ONE
 
-        with self._open_for_typing() as ser:
-            self.log(f"[INFO] Opened {ser.port} for typing: {ser.baudrate} 8N2.")
-            for idx, ln in enumerate(lines, start=1):
-                if self.cancel_event.is_set():
-                    raise InterruptedError("Cancelled during BASIC send.")
-                self._type_line(ser, ln)
-                pct = (idx / total) * 100.0
-                self._set_basic_progress(pct, f"{idx}/{total} lines")
+    def _parse_addr(self) -> int:
+        s = self.var_addr.get().strip().lower()
+        if s.endswith("h"):
+            return int(s[:-1], 16)
+        return int(s, 0)
 
+    def _type_line(self, ser: serial.Serial, line: str):
+        char_delay = float(self.var_char.get())
+        line_delay = float(self.var_line.get())
+        for ch in line.encode("ascii", errors="replace"):
             if self.cancel_event.is_set():
-                raise InterruptedError("Cancelled before EXEC&HEE33.")
-            self._type_line(ser, "EXEC&HEE33")
-            self._set_basic_progress(100.0, f"{total}/{total} lines (EXEC&HEE33 sent)")
-            self.log("[INFO] Sent EXEC&HEE33 after BASIC to release slave mode (if active).")
+                raise InterruptedError("Cancelled during BASIC typing.")
+            ser.write(bytes([ch]))
+            ser.flush()
+            time.sleep(char_delay)
+        ser.write(b"\r")
+        ser.flush()
+        time.sleep(line_delay)
 
+    # ---------------- File pickers ----------------
+    def pick_basic(self):
+        p = filedialog.askopenfilename(
+            title="Select BASIC program (.txt/.bas)",
+            filetypes=[("BASIC text", "*.txt *.bas"), ("All files", "*.*")]
+        )
+        if not p:
+            return
+        self.basic_file = Path(p)
+        self.lbl_basic.config(text=f"Selected BASIC: {self.basic_file}")
+        self.log(f"[OK] BASIC selected: {self.basic_file}")
+
+    def pick_bin(self):
+        p = filedialog.askopenfilename(
+            title="Select ASM binary (.bin)",
+            filetypes=[("Binary", "*.bin"), ("All files", "*.*")]
+        )
+        if not p:
+            return
+        self.bin_file = Path(p)
+        self.lbl_bin.config(text=f"Selected ASM binary: {self.bin_file}")
+        self.log(f"[OK] BIN selected: {self.bin_file}")
+
+    def pick_cas(self):
+        p = filedialog.askopenfilename(
+            title="Select CAS/K7",
+            filetypes=[("CAS/K7", "*.cas *.k7"), ("All files", "*.*")]
+        )
+        if not p:
+            return
+        self.cas_file = Path(p)
+        self.lbl_cas.config(text=f"Selected CAS/K7: {self.cas_file}")
+        self.log(f"[OK] CAS/K7 selected: {self.cas_file}")
+
+    # ---------------- Slave mode helper ----------------
     def disable_slave_mode(self):
         self._run_threaded(self._disable_slave_mode_impl, "Disable slave mode (EXEC&HEE33)")
 
     def _disable_slave_mode_impl(self):
         self._set_status("sending EXEC&HEE33")
-        with self._open_for_typing() as ser:
-            self.log(f"[INFO] Opened {ser.port} for typing: {ser.baudrate} 8N2.")
-            self._type_line(ser, "EXEC&HEE33")
-            self.log("[INFO] EXEC&HEE33 sent.")
+        self._set_progress(0, "sending EXEC&HEE33")
+        try:
+            with self._open_for_typing() as ser:
+                self._type_line(ser, "EXEC&HEE33")
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
+        self._set_progress(100, "done")
+        self.log("[INFO] EXEC&HEE33 sent.")
 
+    # ---------------- BASIC (.txt/.bas) ----------------
+    def send_basic_file(self):
+        if not self.basic_file or not self.basic_file.exists():
+            messagebox.showwarning("Missing BASIC", "Select a BASIC .txt/.bas file first.")
+            return
+        self._run_threaded(self._send_basic_file_impl, "Send BASIC (.txt/.bas)")
+
+    def _send_basic_file_impl(self):
+        self._set_status("typing BASIC (.txt/.bas)")
+        self._set_progress(0, "starting...")
+
+        lines = self.basic_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = [ln.rstrip("\r\n") for ln in lines if ln.strip() != ""]
+        total = max(1, len(lines) + 1)
+
+        try:
+            with self._open_for_typing() as ser:
+                self.log(f"[INFO] Opened {ser.port} for typing: {ser.baudrate} 8N2.")
+                for idx, ln in enumerate(lines, start=1):
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Cancelled during BASIC send.")
+                    self._type_line(ser, ln)
+                    self._set_progress((idx / total) * 100.0, f"BASIC {idx}/{total} lines")
+
+                if self.cancel_event.is_set():
+                    raise InterruptedError("Cancelled before EXEC&HEE33.")
+                self._type_line(ser, "EXEC&HEE33")
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
+
+        self._set_progress(100.0, f"BASIC {total}/{total} lines (done)")
+        self.log("[INFO] Sent EXEC&HEE33 after BASIC.")
+
+    # ---------------- Fast loader + ASM ----------------
     def send_fast_loader(self):
         self._run_threaded(self._send_fast_loader_impl, "Send BASIC fast loader")
 
@@ -392,7 +622,6 @@ class X07LoaderApp(tk.Tk):
         addr = self._parse_addr()
         xfer_baud = int(self.var_xfer_baud.get())
         append_run = self.var_append_run.get()
-
         lines = [
             "NEW",
             "1 EXEC&HEE33",
@@ -411,89 +640,82 @@ class X07LoaderApp(tk.Tk):
 
     def _send_fast_loader_impl(self):
         self._set_status("typing fast loader")
-        self._set_basic_progress(0, "typing loader...")
-
         loader_lines = self._build_fast_loader_lines()
         total = max(1, len(loader_lines))
+        self._set_progress(0, "typing loader...")
 
-        with self._open_for_typing() as ser:
-            self.log(f"[INFO] Opened {ser.port} for typing: {ser.baudrate} 8N2.")
-            for i, l in enumerate(loader_lines, start=1):
-                if self.cancel_event.is_set():
-                    raise InterruptedError("Cancelled during loader typing.")
-                self._type_line(ser, l)
-                self._set_basic_progress((i / total) * 100.0, f"{i}/{total} lines")
+        try:
+            with self._open_for_typing() as ser:
+                for i, l in enumerate(loader_lines, start=1):
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Cancelled during loader typing.")
+                    self._type_line(ser, l)
+                    self._set_progress((i / total) * 100.0, f"Loader {i}/{total} lines")
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
 
-            if not self.var_append_run.get():
-                if self.cancel_event.is_set():
-                    raise InterruptedError("Cancelled before EXEC&HEE33.")
-                self._type_line(ser, "EXEC&HEE33")
-                self.log("[INFO] Loader typed but NOT started (no RUN). Sent EXEC&HEE33 to release slave mode.")
-            else:
-                self.log("[INFO] Loader typed and started (RUN). Not sending EXEC&HEE33 now.")
-
+        self._set_progress(100.0, "loader done")
         if self.var_append_run.get():
-            self.log("[INFO] X-07 should now be waiting for: N<CR> then N decimal byte lines (7E1).")
+            self.log("[INFO] Loader typed and started (RUN).")
+        else:
+            self.log("[INFO] Loader typed (no RUN). Start manually if needed.")
 
     def send_bin_only(self):
         if not self.bin_file or not self.bin_file.exists():
-            messagebox.showwarning("Missing BIN", "Please select a .bin file first.")
+            messagebox.showwarning("Missing BIN", "Select a .bin file first.")
             return
-        self._run_threaded(self._send_bin_only_impl, "Send ASM binary (expects BASIC loader running)")
+        self._run_threaded(self._send_bin_only_impl, "Send ASM (loader running)")
 
     def _send_bin_only_impl(self):
         self._set_status("transferring ASM (.bin)")
-        self._set_asm_progress(0, "starting...")
+        self._set_progress(0, "starting...")
 
-        addr = self._parse_addr()
         data = self.bin_file.read_bytes()
         n = len(data)
         if n <= 0:
             raise RuntimeError("Binary is empty.")
 
-        self.log(f"[INFO] BIN size: {n} bytes. Target load address: 0x{addr:04X}")
-        self.log("[INFO] This expects the fast loader already running on the X-07.")
+        addr = self._parse_addr()
+        self.log(f"[INFO] BIN size: {n} bytes. Target load: 0x{addr:04X}")
 
-        with self._open_for_typing() as ser:
-            self.log(f"[INFO] Opened {ser.port} for typing: {ser.baudrate} 8N2.")
-            self._switch_to_xfer(ser)
-            self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
-            time.sleep(float(self.var_post_init_delay.get()))
+        try:
+            with self._open_for_typing() as ser:
+                self._switch_to_xfer(ser)
+                self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
+                time.sleep(float(self.var_post.get()))
 
-            if self.cancel_event.is_set():
-                raise InterruptedError("Cancelled before length send.")
-
-            ser.write(f"{n}\r".encode("ascii"))
-            ser.flush()
-            time.sleep(0.01)
-
-            byte_delay = float(self.var_byte_delay.get())
-            for i, b in enumerate(data, start=1):
-                if self.cancel_event.is_set():
-                    raise InterruptedError("Cancelled during ASM transfer.")
-                ser.write(f"{b}\r".encode("ascii"))
+                ser.write(f"{n}\r".encode("ascii"))
                 ser.flush()
-                if byte_delay > 0:
-                    time.sleep(byte_delay)
-                pct = (i / n) * 100.0
-                if i == 1 or i == n or (i % 32 == 0):
-                    self._set_asm_progress(pct, f"{i}/{n} bytes")
+                time.sleep(0.01)
 
-        self._set_asm_progress(100.0, f"{n}/{n} bytes (done)")
-        self.log("[INFO] Transfer complete. If loader executes 'EXEC Z', your program should be running now.")
+                byte_delay = float(self.var_byte.get())
+                for i, b in enumerate(data, start=1):
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Cancelled during ASM transfer.")
+                    ser.write(f"{b}\r".encode("ascii"))
+                    ser.flush()
+                    if byte_delay > 0:
+                        time.sleep(byte_delay)
+                    if i == 1 or i == n or (i % 32 == 0):
+                        self._set_progress((i / n) * 100.0, f"ASM {i}/{n} bytes")
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
+
+        self._set_progress(100.0, "ASM done")
+        self.log("[INFO] ASM transfer done.")
 
     def send_loader_and_bin(self):
         if not self.bin_file or not self.bin_file.exists():
-            messagebox.showwarning("Missing BIN", "Please select a .bin file first.")
+            messagebox.showwarning("Missing BIN", "Select a .bin file first.")
             return
-        self._run_threaded(self._send_loader_and_bin_impl, "Send fast loader + ASM (one click)")
+        self._run_threaded(self._send_loader_and_bin_impl, "One click: loader + ASM")
 
     def _send_loader_and_bin_impl(self):
         self._set_status("typing loader + transferring ASM")
-        self._set_basic_progress(0, "typing loader...")
-        self._set_asm_progress(0, "pending...")
+        self._set_progress(0, "starting...")
 
-        addr = self._parse_addr()
         data = self.bin_file.read_bytes()
         n = len(data)
         if n <= 0:
@@ -502,50 +724,200 @@ class X07LoaderApp(tk.Tk):
         loader_lines = self._build_fast_loader_lines()
         total_loader = max(1, len(loader_lines))
 
-        with self._open_for_typing() as ser:
-            self.log(f"[INFO] Opened {ser.port} for typing: {ser.baudrate} 8N2.")
+        try:
+            with self._open_for_typing() as ser:
+                for i, l in enumerate(loader_lines, start=1):
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Cancelled during loader typing.")
+                    self._type_line(ser, l)
+                    self._set_progress((i / total_loader) * 50.0, f"Loader {i}/{total_loader} lines")
 
-            # 1) Type loader
-            for i, l in enumerate(loader_lines, start=1):
-                if self.cancel_event.is_set():
-                    raise InterruptedError("Cancelled during loader typing.")
-                self._type_line(ser, l)
-                self._set_basic_progress((i / total_loader) * 100.0, f"{i}/{total_loader} lines")
+                if not self.var_append_run.get():
+                    self.log("[WARN] Loader typed without RUN. Enable Append RUN or start manually.")
+                    return
 
-            if not self.var_append_run.get():
-                self.log("[WARN] Loader was typed without RUN. Enable 'Append RUN' or start it manually.")
-                return
+                self._switch_to_xfer(ser)
+                self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
+                time.sleep(float(self.var_post.get()))
 
-            if self.cancel_event.is_set():
-                raise InterruptedError("Cancelled before transfer phase.")
-
-            # 2) Switch PC side to 7E1
-            self._switch_to_xfer(ser)
-            self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
-            time.sleep(float(self.var_post_init_delay.get()))
-
-            if self.cancel_event.is_set():
-                raise InterruptedError("Cancelled before length send.")
-
-            # 3) Send N then bytes
-            ser.write(f"{n}\r".encode("ascii"))
-            ser.flush()
-            time.sleep(0.01)
-
-            byte_delay = float(self.var_byte_delay.get())
-            for i, b in enumerate(data, start=1):
-                if self.cancel_event.is_set():
-                    raise InterruptedError("Cancelled during ASM transfer.")
-                ser.write(f"{b}\r".encode("ascii"))
+                ser.write(f"{n}\r".encode("ascii"))
                 ser.flush()
-                if byte_delay > 0:
-                    time.sleep(byte_delay)
-                pct = (i / n) * 100.0
-                if i == 1 or i == n or (i % 32 == 0):
-                    self._set_asm_progress(pct, f"{i}/{n} bytes")
+                time.sleep(0.01)
 
-        self._set_asm_progress(100.0, f"{n}/{n} bytes (done)")
-        self.log("[INFO] One-click complete. X-07 should execute the binary automatically (EXEC Z).")
+                byte_delay = float(self.var_byte.get())
+                for i, b in enumerate(data, start=1):
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Cancelled during ASM transfer.")
+                    ser.write(f"{b}\r".encode("ascii"))
+                    ser.flush()
+                    if byte_delay > 0:
+                        time.sleep(byte_delay)
+                    if i == 1 or i == n or (i % 32 == 0):
+                        pct = 50.0 + (i / n) * 50.0
+                        self._set_progress(pct, f"ASM {i}/{n} bytes")
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
+
+        self._set_progress(100.0, "one-click done")
+        self.log("[INFO] One-click complete.")
+
+    # ---------------- CAS/K7 (RAW BYTES) ----------------
+    def inspect_cas_header(self):
+        if not self.cas_file or not self.cas_file.exists():
+            messagebox.showwarning("Missing CAS/K7", "Select a .cas/.k7 file first.")
+            return
+        data = self.cas_file.read_bytes()
+        name = guess_name_in_first_16_bytes(data, self.cas_file.stem)
+
+        self.log("[INFO] Inspect header:")
+        self.log(f"       File: {self.cas_file.name}")
+        self.log(f"       Name guess: {name}")
+        self.log("       Preview @0x0000:")
+
+        chunk = data[:96]
+        hexline = " ".join(f"{b:02X}" for b in chunk[:64])
+        asciiline = "".join(chr(b) if 0x20 <= b <= 0x7E else "." for b in chunk[:64])
+        self.log(f"       0x0000: {hexline}")
+        self.log(f"               {asciiline}")
+
+    def send_cas_raw(self):
+        if not self.cas_file or not self.cas_file.exists():
+            messagebox.showwarning("Missing CAS/K7", "Select a .cas/.k7 file first.")
+            return
+        self._run_threaded(self._send_cas_raw_impl, 'Send CAS/K7 raw stream (LOAD"COM:")')
+
+    def _send_cas_raw_impl(self):
+        self._set_status("sending CAS/K7 raw bytes")
+        self._set_progress(0, "starting...")
+
+        data = self.cas_file.read_bytes()
+        base = CAS_FIXED_BASE
+        payload = data[base:]
+        if not payload:
+            raise RuntimeError("Empty payload (base beyond file length).")
+
+        name = guess_name_in_first_16_bytes(data, self.cas_file.stem)
+        self.log(f'[INFO] CAS/K7 file: {self.cas_file.name} | name guess: {name}')
+        self.log(f'[INFO] Sending raw bytes from base=0x{base:04X} (len={len(payload)}).')
+        self.log('[INFO] X-07 side: LOAD"COM:" then press RETURN.')
+
+        total = len(payload)
+
+        try:
+            with self._open_for_typing() as ser:
+                sent = 0
+                CHUNK = 512
+                while sent < total:
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Cancelled during CAS/K7 transfer.")
+                    end = min(total, sent + CHUNK)
+                    ser.write(payload[sent:end])
+                    ser.flush()
+                    sent = end
+                    if sent == total or (sent % 4096 == 0):
+                        self._set_progress((sent / total) * 100.0, f"CAS/K7 {sent}/{total} bytes")
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
+
+        self._set_progress(100.0, "CAS/K7 done")
+        self.log("[INFO] CAS/K7 raw transfer finished.")
+
+    # ---------------- Remote keyboard ----------------
+    def toggle_remote_keyboard(self):
+        if self.job_running:
+            self.log("[WARN] Remote keyboard is disabled during transfers.")
+            self._set_status("remote keyboard disabled during transfer")
+            return
+
+        if self.remote_kbd_on:
+            self._remote_keyboard_off(reason="[OK] REMOTE KEYBOARD: OFF")
+        else:
+            self._remote_keyboard_on()
+
+    def _remote_keyboard_on(self):
+        try:
+            self.remote_ser = self._open_for_typing()
+        except (SerialException, OSError) as e:
+            self.remote_ser = None
+            self.remote_kbd_on = False
+            self.btn_remote_toggle.config(text="REMOTE KEYBOARD: OFF")
+            self._set_keyboard_controls_enabled(False)
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r} for remote keyboard: {e}")
+            self._set_status("remote keyboard start failed (check COM port)")
+            return
+
+        self.remote_kbd_on = True
+        self.btn_remote_toggle.config(text="REMOTE KEYBOARD: ON")
+        self._set_keyboard_controls_enabled(True)
+        self.log(f"[OK] REMOTE KEYBOARD: ON ({self.remote_ser.port} @ {self.remote_ser.baudrate} 8N2).")
+        self.log('[INFO] Remote keyboard requires SLAVE mode (INIT#5,"COM:" then EXEC&HEE1F).')
+
+    def _remote_keyboard_off(self, reason: str = "[OK] REMOTE KEYBOARD: OFF"):
+        try:
+            if self.remote_ser:
+                self.remote_ser.close()
+        except Exception:
+            pass
+        self.remote_ser = None
+        self.remote_kbd_on = False
+        self.btn_remote_toggle.config(text="REMOTE KEYBOARD: OFF")
+        self._set_keyboard_controls_enabled(False)
+        self.log(reason)
+
+    def _kbd_send_byte(self, b: int):
+        if not self.remote_kbd_on or not self.remote_ser:
+            return
+        try:
+            self.remote_ser.write(bytes([b & 0xFF]))
+            self.remote_ser.flush()
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Remote keyboard write failed: {e}")
+            self._remote_keyboard_off(reason="[WARN] REMOTE KEYBOARD stopped (write error).")
+
+    def _kbd_send_bytes(self, data: bytes):
+        if not self.remote_kbd_on or not self.remote_ser:
+            return
+        try:
+            self.remote_ser.write(data)
+            self.remote_ser.flush()
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Remote keyboard write failed: {e}")
+            self._remote_keyboard_off(reason="[WARN] REMOTE KEYBOARD stopped (write error).")
+
+    def _on_remote_keypress(self, event):
+        # Only send if remote keyboard ON; always block local text insertion
+        if not self.remote_kbd_on:
+            return "break"
+
+        k = event.keysym
+
+        if k == "Left":
+            self._kbd_send_byte(KEY_LEFT);  return "break"
+        if k == "Right":
+            self._kbd_send_byte(KEY_RIGHT); return "break"
+        if k == "Up":
+            self._kbd_send_byte(KEY_UP);    return "break"
+        if k == "Down":
+            self._kbd_send_byte(KEY_DOWN);  return "break"
+        if k == "Home":
+            self._kbd_send_byte(KEY_HOME);  return "break"
+        if k == "Insert":
+            self._kbd_send_byte(KEY_INS);   return "break"
+        if k == "Delete":
+            self._kbd_send_byte(KEY_DEL);   return "break"
+        if k in ("Return", "KP_Enter"):
+            self._kbd_send_byte(KEY_RETURN); return "break"
+        if k == "space":
+            self._kbd_send_byte(KEY_SPACE);  return "break"
+
+        ch = event.char
+        if ch:
+            b = ord(ch)
+            if 0x20 <= b <= 0x7E:
+                self._kbd_send_byte(b)
+        return "break"
 
 
 if __name__ == "__main__":

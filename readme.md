@@ -6,24 +6,28 @@
 
 ### Présentation
 
-Cet outil, basé sur une interface graphique **Tkinter**, permet de transférer des programmes vers un **Canon X-07** à l’aide d’un câble **série**.
+Cet outil, basé sur une interface graphique **Tkinter**, permet de transférer des programmes vers un **Canon X-07** via une liaison **série**.
 
-Il propose deux modes principaux :
+Il prend en charge :
 
-* **Envoi BASIC « lent »** : le programme saisit (« tape ») un fichier `.txt` ligne par ligne en **8N2**, ce qui garantit une compatibilité maximale avec la saisie BASIC du X-07.
-* **Fast loader + transfert ASM** : le programme envoie d’abord un petit loader BASIC, puis transfère un binaire `.bin` beaucoup plus rapidement en basculant en **7E1**.
+* **BASIC (listing texte)** : envoi d’un fichier `.txt` / `.bas` en le « tapant » ligne par ligne.
+* **BASIC (cassette en flux brut)** : envoi d’un fichier `.cas` / `.k7` comme un flux d’octets via `LOAD"COM:"`.
+* **ASM (rapide)** : envoi d’un petit loader BASIC, puis transfert accéléré d’un binaire `.bin`.
+* **Clavier distant (REMOTE KEYBOARD)** : saisie depuis le PC et envoi immédiat des frappes / touches spéciales vers le X-07.
 
-L’outil intègre :
+L’application fournit :
 
-* une console de logs avec horodatage `[hh:mm:ss]`,
-* des barres de progression pour BASIC et ASM,
-* un bouton d’annulation permettant d’interrompre proprement un transfert en cours.
+* une console de logs horodatée `[hh:mm:ss]`,
+* une barre de progression commune,
+* un bouton d’annulation pour interrompre proprement un transfert,
+* des boutons de touches spéciales et des macros (F1…F10).
 
 ---
 
 ### Prérequis
 
 * Python 3.10 ou plus récent (recommandé)
+* `pyserial` (installé automatiquement au premier lancement si nécessaire)
 
 ---
 
@@ -34,115 +38,213 @@ L’outil intègre :
 
 ---
 
-### Utilisation rapide
-
-Lancer l’application :
+### Lancer l’application
 
 ```bash
 python x07_loader.pyw
 ```
 
-1. Sélectionner le **port COM** dans la section *Serial settings* (aucun port n’est sélectionné par défaut).
-2. (Optionnel) Envoyer un programme BASIC `.txt` via **Send BASIC (.txt)**.
-3. Pour un transfert rapide :
+1. Sélectionner le **port COM** dans *Serial settings*.
+2. Ajuster si besoin :
 
-   * Cliquer sur **Select bin…** et choisir un fichier `.bin`.
-   * Renseigner **Load address** (par exemple `0x1800`).
-   * Cliquer sur **Send BASIC fast loader**.
-   * Puis cliquer sur **Send ASM binary (expects BASIC loader running)**,
-     ou utiliser directement **Send fast loader + ASM (one click)**.
+   * **Typing baud (8N2)** : vitesse utilisée pour la saisie BASIC, le clavier distant et les flux cassette.
+   * **Xfer baud (7E1)** : vitesse utilisée pour le transfert rapide ASM.
+   * **CHAR(s)** / **LINE(s)** : délais (en secondes) entre caractères / entre lignes lors de la saisie BASIC.
+   * **PostINIT(s)** : pause (en secondes) après bascule en mode transfert (7E1).
+   * **Byte(s)** : délai (en secondes) entre octets lors de l’envoi ASM (format décimal ligne par ligne).
 
 ---
 
-### ⚠️ Mode « Slave » du Canon X-07 (obligatoire avant tout transfert série)
+### ⚠️ Mode « Slave » du Canon X-07 (requis)
 
-Conformément à la documentation officielle du Canon X-07 (guide de l’utilisateur, page 119), **le X-07 doit être placé en mode “slave” pour la réception de données via le port série**.
+Conformément à la documentation officielle du Canon X-07 (guide de l’utilisateur, page 119), **le X-07 doit être placé en mode “slave” avant tout transfert série de type “saisie clavier”**.
 
-Dans ce mode, le périphérique série (`COM:`) devient la **source d’entrée console**, et le clavier local est ignoré. Le Canon X-07 peut alors être entièrement contrôlé à distance via la liaison RS-232C.
+Le mode *slave* est requis pour :
 
-#### Entrée en mode slave
+* **BASIC texte** (`.txt` / `.bas`)
+* **ASM** (fast loader + `.bin`)
+* **REMOTE KEYBOARD**
 
-À saisir depuis le clavier du Canon X-07 :
+Dans ce mode :
+
+* le périphérique série (`COM:`) devient l’**entrée console**,
+* le clavier local du X-07 est ignoré,
+* les caractères reçus sont interprétés comme des frappes clavier.
+
+#### Entrer en mode slave
+
+À saisir sur le Canon X-07 :
 
 ```basic
 INIT#5,"COM:
 EXEC&HEE1F
 ```
 
-Effet :
+#### Quitter le mode slave
 
-* le clavier du X-07 est désactivé,
-* les caractères reçus sur le port série sont traités comme des frappes clavier.
+Deux méthodes :
 
-#### Sortie du mode slave
-
-Deux méthodes sont possibles :
-
-1. Redémarrer le Canon X-07 (coupure puis remise sous tension).
-2. Envoyer la commande suivante **depuis le port série** :
+1. Redémarrer le Canon X-07 (OFF puis ON).
+2. Envoyer depuis le port série :
 
 ```basic
 EXEC&HEE33
 ```
 
-Remarques importantes :
-
-* Le bouton **Disable slave mode (EXEC&HEE33)** de l’outil permet de quitter ce mode à distance.
-* Le fast loader BASIC envoie systématiquement `EXEC&HEE33` au début afin de garantir un état cohérent.
-* Selon l’option *Append RUN*, cette commande peut également être envoyée à la fin du chargement.
+Le bouton **Disable slave (EXEC&HEE33)** de l’application permet de quitter ce mode à distance.
 
 ---
 
-### Adresse de chargement du programme ASM
+## BASIC
 
-Le champ **Load address** définit l’adresse mémoire à laquelle le binaire ASM (`.bin`) sera copié sur le Canon X-07.
+### 1) BASIC texte (.txt / .bas) via SLAVE mode
 
-⚠️ **Cette adresse doit impérativement correspondre à celle utilisée lors de la compilation du programme assembleur**.
+Objectif : transférer un listing BASIC texte en le « tapant » comme si les lignes étaient saisies au clavier.
 
-En pratique :
+Procédure :
 
-* Le code ASM est assemblé avec une directive du type :
+1. Mettre le X-07 en **SLAVE mode**.
+2. Dans la section **Text listing (.txt/.bas)** :
 
-  ```asm
-  ORG $1800
-  ```
-* Le binaire généré **suppose** que son point d’entrée et ses références internes sont valides à cette adresse.
-* Si le binaire est copié à une adresse différente de celle prévue à l’assemblage :
+   * **Select .txt/.bas…**
+   * **Send BASIC**
 
-  * les sauts (`JP`, `CALL`),
-  * les accès mémoire,
-  * et les données référencées
-    deviendront incorrects, entraînant un comportement imprévisible ou un plantage.
+Fonctionnement :
 
-Il est donc essentiel de :
-
-* compiler le programme ASM avec l’adresse souhaitée,
-* renseigner exactement la même valeur dans **Load address** avant le transfert.
+* l’outil envoie les lignes en **8N2**, avec les délais **CHAR(s)** et **LINE(s)**,
+* à la fin, l’outil envoie `EXEC&HEE33` pour relâcher l’état console distant (si actif).
 
 ---
 
-### Détails techniques (liaison série)
+### 2) BASIC cassette stream (.cas / .k7) via LOAD "COM:" (raw bytes)
 
-* **Saisie BASIC** : 8N2 (4800 bauds par défaut)
-* **Transfert rapide (loader)** : 7E1 (8000 bauds par défaut)
+Objectif : envoyer un fichier cassette en flux brut, comme si le X-07 lisait une cassette depuis `COM:`.
 
-Le loader BASIC attend :
+Côté Canon X-07 :
 
-1. Une ligne contenant `N` (le nombre d’octets à recevoir).
-2. Puis `N` lignes, chacune contenant un octet en décimal.
+1. **Ne pas** être en mode slave.
+2. Lancer la commande :
+
+```basic
+LOAD"COM:"
+```
+
+3. Appuyer sur **RETURN** (le X-07 attend alors le flux d’octets).
+
+Côté PC :
+
+1. Dans la section **Cassette stream (.cas/.k7)** :
+
+   * **Select .cas/.k7…**
+   * (optionnel) **Inspect header**
+   * **Send raw stream**
+
+Notes importantes :
+
+* L’envoi est réalisé en **8N2**.
+* Le point de départ d’envoi est **fixe** : le transfert commence à l’offset **`0x0010`** du fichier (base validée).
+* Le bouton **Inspect header** affiche uniquement un **preview @0x0000** (aide au diagnostic / comparaison de fichiers).
 
 ---
 
-### Dépannage
+## ASM via SLAVE mode
 
-* **Aucun port COM visible** : vérifier le branchement de l’adaptateur et l’installation du pilote, puis cliquer sur **Refresh**.
-* **Erreur indiquant qu’aucun port COM n’est sélectionné** : sélectionner un port valide dans la liste.
-* **Le Canon X-07 ne réagit pas** :
+Objectif : transférer rapidement un binaire assembleur `.bin`.
 
-  * vérifier le câblage RX / TX / GND,
-  * vérifier les paramètres série (baudrate, 8N2 / 7E1),
-  * augmenter `Post INIT wait (s)` et/ou `Byte delay (s)`.
-* **Transfert instable** : augmenter progressivement `Byte delay (s)` (par exemple de 0,03 à 0,06) et conserver un délai `Post INIT wait` suffisant.
+Principe :
+
+1. L’outil tape un **loader BASIC**.
+2. Le loader configure la liaison série côté X-07 et attend :
+
+   * une ligne `N` (taille du binaire),
+   * puis `N` lignes, chacune contenant un octet en **décimal**.
+3. Le loader copie les octets en mémoire à l’adresse choisie, puis exécute le programme.
+
+Procédure :
+
+1. Mettre le X-07 en **SLAVE mode**.
+2. Dans **ASM via SLAVE mode** :
+
+   * **Select bin…**
+   * régler **Load addr**
+   * choisir :
+
+     * **Send BASIC fast loader** puis **Send ASM (loader running)**, ou
+     * **One click: loader + ASM**
+
+### Adresse de chargement (Load addr)
+
+Le champ **Load addr** définit l’adresse mémoire où le binaire `.bin` est copié.
+
+⚠️ Cette adresse doit correspondre à celle utilisée à l’assemblage.
+
+Exemple :
+
+```asm
+ORG $1800
+```
+
+Si le binaire est copié à une autre adresse que celle prévue (ORG), alors :
+
+* les `JP` / `CALL`,
+* les accès mémoire,
+* et les données référencées
+
+peuvent devenir invalides (comportement imprévisible ou crash).
+
+---
+
+## Remote keyboard via SLAVE mode
+
+Objectif : contrôler le X-07 depuis le PC comme un « terminal » (frappes + touches spéciales).
+
+Pré-requis :
+
+1. Mettre le X-07 en **SLAVE mode**.
+2. Activer **REMOTE KEYBOARD: ON**.
+
+Fonctionnement :
+
+* Quand **REMOTE KEYBOARD est ON**, l’application ouvre une session série persistante en **8N2**.
+* La zone de saisie envoie directement les caractères ASCII imprimables.
+* Les boutons envoient des **codes de touches** (HOME/CLR/INS/DEL/BREAK/flèches) conformes au X-07.
+* Les touches **F1…F10** envoient des macros :
+
+  * F1 : `?TIME$` + RETURN
+  * F2 : `CLOAD"` + RETURN
+  * F3 : `LOCATE `
+  * F4 : `LIST `
+  * F5 : `RUN` + RETURN
+  * F6 : `?DATE$` + RETURN
+  * F7 : `CSAVE"` + RETURN
+  * F8 : `PRINT `
+  * F9 : `SLEEP`
+  * F10 : `CONT` + RETURN
+
+Sécurité :
+
+* Pendant un transfert (BASIC/ASM/CAS), le clavier distant est automatiquement désactivé.
+
+---
+
+## Dépannage
+
+* **Aucun port COM visible** : vérifier le branchement de l’adaptateur, l’installation du pilote, puis cliquer sur **Refresh**.
+* **Impossible d’ouvrir un port COM** : essayer un autre port, vérifier que le port n’est pas déjà utilisé par un autre logiciel.
+* **Le X-07 ne réagit pas (BASIC/ASM/REMOTE KEYBOARD)** :
+
+  * vérifier que le X-07 est bien en **SLAVE mode**,
+  * vérifier RX / TX / GND,
+  * vérifier les paramètres (8N2 vs 7E1 selon le mode),
+  * ajuster **CHAR(s)** / **LINE(s)** pour la saisie BASIC.
+* **Transfert ASM instable** :
+
+  * augmenter **PostINIT(s)**,
+  * augmenter légèrement **Byte(s)**.
+* **LOAD"COM:" ne charge rien (CAS/K7)** :
+
+  * vérifier que l’envoi est déclenché après le RETURN côté X-07,
+  * vérifier la cohérence du fichier et l’offset d’envoi (0x0010).
 
 ---
 
@@ -150,140 +252,242 @@ Le loader BASIC attend :
 
 ### Overview
 
-This tool, based on a **Tkinter** graphical interface, allows programs to be transferred to a **Canon X-07** using a **serial** cable.
+This tool, built with a **Tkinter** GUI, transfers programs to a **Canon X-07** over a **serial** link.
 
-Two main modes are available:
+It supports:
 
-* **Slow BASIC send**: a `.txt` BASIC listing is typed line by line using **8N2**, ensuring maximum compatibility with the X-07 BASIC input.
-* **Fast loader + ASM transfer**: a small BASIC loader is typed first, then a `.bin` file is transferred much faster by switching to **7E1**.
+* **BASIC (text listing)**: sends a `.txt` / `.bas` file by “typing” it line by line.
+* **BASIC (cassette raw stream)**: sends a `.cas` / `.k7` file as raw bytes via `LOAD"COM:"`.
+* **ASM (fast)**: types a small BASIC loader, then transfers a `.bin` much faster.
+* **Remote keyboard (REMOTE KEYBOARD)**: sends PC keystrokes and special keys to the X-07.
 
 The application provides:
 
-* a console with timestamped logs `[hh:mm:ss]`,
-* progress bars for BASIC and ASM transfers,
-* a cancel button to safely interrupt an ongoing transfer.
+* a timestamped log console `[hh:mm:ss]`,
+* a single shared progress bar,
+* a cancel button to safely stop an ongoing transfer,
+* special key buttons and function-key macros (F1…F10).
 
 ---
 
 ### Requirements
 
 * Python 3.10 or newer (recommended)
+* `pyserial` (auto-installed on first run if needed)
 
 ---
 
 ### Required hardware
 
 * A working Canon X-07
-* A USB-to-serial adapter recognized by the system (COM port on Windows) or proper serial wiring for the X-07 (RX, TX, GND, etc.)
+* A USB-to-serial adapter (COM port on Windows) or proper serial wiring for the X-07 (RX, TX, GND, etc.)
 
 ---
 
-### Quick start
-
-Run the application:
+### Running the app
 
 ```bash
 python x07_loader.pyw
 ```
 
-1. Select the **COM port** in the *Serial settings* section (no default port is selected).
-2. (Optional) Send a BASIC `.txt` program using **Send BASIC (.txt)**.
-3. For fast transfer:
+1. Select the **COM port** in *Serial settings*.
+2. Adjust if needed:
 
-   * Click **Select bin…** and choose a `.bin` file.
-   * Set the **Load address** (for example `0x1800`).
-   * Click **Send BASIC fast loader**.
-   * Then click **Send ASM binary (expects BASIC loader running)**,
-     or directly use **Send fast loader + ASM (one click)**.
+   * **Typing baud (8N2)**: used for BASIC typing, remote keyboard, and cassette streaming.
+   * **Xfer baud (7E1)**: used for fast ASM transfers.
+   * **CHAR(s)** / **LINE(s)**: delays (seconds) between characters / lines when typing BASIC.
+   * **PostINIT(s)**: delay (seconds) after switching to transfer mode (7E1).
+   * **Byte(s)**: delay (seconds) between bytes during ASM sending (decimal byte lines).
 
 ---
 
-### ⚠️ Canon X-07 “Slave mode” (required before any serial transfer)
+### ⚠️ Canon X-07 “Slave mode” (required)
 
-According to the official Canon X-07 user manual (page 119), **the X-07 must be placed in “slave” mode before any remote control or data transfer via the serial port**.
+According to the official Canon X-07 user manual (page 119), **the X-07 must be placed in “slave” mode before any serial workflow that emulates keyboard input**.
 
-In this mode, the serial device (`COM:`) becomes the **console input source**, and the local keyboard is ignored. The Canon X-07 can then be fully controlled remotely through the RS‑232C interface.
+Slave mode is required for:
+
+* **BASIC text** (`.txt` / `.bas`)
+* **ASM** (fast loader + `.bin`)
+* **REMOTE KEYBOARD**
+
+In slave mode:
+
+* the serial device (`COM:`) becomes the **console input**,
+* the local X-07 keyboard is ignored,
+* received characters are processed like keyboard input.
 
 #### Entering slave mode
 
-To be typed on the Canon X-07 keyboard:
+Type on the Canon X-07:
 
 ```basic
 INIT#5,"COM:
 EXEC&HEE1F
 ```
 
-Effect:
-
-* the X-07 keyboard is disabled,
-* characters received from the serial port are processed as keyboard input.
-
 #### Leaving slave mode
 
-Two methods are available:
+Two options:
 
 1. Power the Canon X-07 off and on again.
-2. Send the following command **from the serial device**:
+2. Send from the serial device:
 
 ```basic
 EXEC&HEE33
 ```
 
+The **Disable slave (EXEC&HEE33)** button sends this command directly.
+
+---
+
+## BASIC
+
+### 1) BASIC text (.txt / .bas) via SLAVE mode
+
+Goal: transfer a BASIC text listing by “typing” it as if entered from the keyboard.
+
+Steps:
+
+1. Put the X-07 into **SLAVE mode**.
+2. In **Text listing (.txt/.bas)**:
+
+   * **Select .txt/.bas…**
+   * **Send BASIC**
+
+How it works:
+
+* lines are sent in **8N2** using **CHAR(s)** and **LINE(s)** delays,
+* at the end, the tool sends `EXEC&HEE33` to release the remote console state (if active).
+
+---
+
+### 2) BASIC cassette stream (.cas / .k7) via LOAD "COM:" (raw bytes)
+
+Goal: send a cassette file as a raw byte stream, as if the X-07 was reading from `COM:`.
+
+On the Canon X-07:
+
+1. Do **not** use slave mode.
+2. Run:
+
+```basic
+LOAD"COM:"
+```
+
+3. Press **RETURN** to start waiting for incoming bytes.
+
+On the PC:
+
+1. In **Cassette stream (.cas/.k7)**:
+
+   * **Select .cas/.k7…**
+   * (optional) **Inspect header**
+   * **Send raw stream**
+
 Important notes:
 
-* The **Disable slave mode (EXEC&HEE33)** button sends this command directly.
-* The fast loader BASIC always sends `EXEC&HEE33` at the beginning to ensure a known state.
-* Depending on the *Append RUN* option, the command may also be sent at the end of the process.
+* streaming uses **8N2**.
+* the send base is **fixed**: sending starts at file offset **`0x0010`** (validated).
+* **Inspect header** shows only a **preview @0x0000** (useful for comparison / diagnostics).
 
 ---
 
-### ASM load address
+## ASM via SLAVE mode
 
-The **Load address** field defines the memory address where the ASM binary (`.bin`) will be copied on the Canon X-07.
+Goal: quickly transfer an ASM binary `.bin`.
 
-⚠️ **This address must strictly match the address used when assembling the program**.
+Principle:
 
-In practice:
+1. The tool types a **BASIC loader**.
+2. The loader configures the serial link on the X-07 and expects:
 
-* The ASM source is assembled with a directive such as:
+   * one line `N` (binary size),
+   * then `N` lines with one **decimal** byte each.
+3. The loader copies bytes to memory at the chosen address, then executes the program.
 
-  ```asm
-  ORG $1800
-  ```
-* The generated binary assumes that its entry point and internal references are valid at this address.
-* If the binary is copied to a different address than the one used during assembly:
+Steps:
 
-  * jumps (`JP`, `CALL`),
-  * memory accesses,
-  * and referenced data
-    will become invalid, leading to unpredictable behavior or crashes.
+1. Put the X-07 into **SLAVE mode**.
+2. In **ASM via SLAVE mode**:
 
-It is therefore mandatory to:
+   * **Select bin…**
+   * set **Load addr**
+   * use either:
 
-* assemble the program with the intended load address,
-* enter exactly the same value in **Load address** before transferring the binary.
+     * **Send BASIC fast loader** then **Send ASM (loader running)**, or
+     * **One click: loader + ASM**
+
+### ASM load address (Load addr)
+
+**Load addr** is the memory address where the `.bin` is copied.
+
+⚠️ It must match the address used when assembling the program.
+
+Example:
+
+```asm
+ORG $1800
+```
+
+If the binary is copied to a different address than the one assumed by `ORG`, then:
+
+* `JP` / `CALL` targets,
+* memory accesses,
+* referenced data
+
+may become invalid (unpredictable behavior or crashes).
 
 ---
 
-### Serial link details
+## Remote keyboard via SLAVE mode
 
-* **BASIC typing**: 8N2 (default 4800 baud)
-* **Fast transfer (loader)**: 7E1 (default 8000 baud)
+Goal: control the X-07 from the PC like a “terminal” (typed characters + special keys).
 
-The BASIC loader expects:
+Pre-requirements:
 
-1. A line containing `N` (number of bytes).
-2. Then `N` lines, each containing one byte value in decimal.
+1. Put the X-07 into **SLAVE mode**.
+2. Toggle **REMOTE KEYBOARD: ON**.
+
+How it works:
+
+* When **REMOTE KEYBOARD is ON**, the app opens a persistent **8N2** serial session.
+* The text box sends printable ASCII characters.
+* Buttons send X-07 **special key codes** (HOME/CLR/INS/DEL/BREAK/arrows).
+* Function-key buttons send macros:
+
+  * F1: `?TIME$` + RETURN
+  * F2: `CLOAD"` + RETURN
+  * F3: `LOCATE `
+  * F4: `LIST `
+  * F5: `RUN` + RETURN
+  * F6: `?DATE$` + RETURN
+  * F7: `CSAVE"` + RETURN
+  * F8: `PRINT `
+  * F9: `SLEEP`
+  * F10: `CONT` + RETURN
+
+Safety:
+
+* During transfers (BASIC/ASM/CAS), the remote keyboard is automatically turned off.
 
 ---
 
-### Troubleshooting
+## Troubleshooting
 
-* **No COM port visible**: check the adapter connection and driver installation, then click **Refresh**.
-* **Error indicating no COM port selected**: select a valid port from the list.
-* **The X-07 does not react**:
+* **No COM port visible**: check adapter connection and driver installation, then click **Refresh**.
+* **Cannot open a COM port**: try another port and ensure it is not used by another program.
+* **X-07 does not react (BASIC/ASM/REMOTE KEYBOARD)**:
 
+  * ensure the X-07 is in **SLAVE mode**,
   * check RX / TX / GND wiring,
-  * verify serial parameters (baud rate, 8N2 / 7E1),
-  * increase `Post INIT wait (s)` and/or `Byte delay (s)`.
-* **Unstable transfers**: gradually increase `Byte delay (s)` (for example from 0.03 to 0.06) and keep a sufficient `Post INIT wait`.
+  * verify serial parameters (8N2 vs 7E1 depending on the workflow),
+  * adjust **CHAR(s)** / **LINE(s)** for BASIC typing.
+* **Unstable ASM transfer**:
+
+  * increase **PostINIT(s)**,
+  * slightly increase **Byte(s)**.
+* **LOAD"COM:" loads nothing (CAS/K7)**:
+
+  * ensure streaming starts after pressing RETURN on the X-07,
+  * verify the file and the send offset (0x0010).
