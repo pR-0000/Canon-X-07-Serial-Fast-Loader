@@ -23,8 +23,10 @@ DEFAULT_CHAR_DELAY_S = 0.04
 DEFAULT_LINE_DELAY_S = 0.20
 DEFAULT_POST_INIT_DELAY_S = 2.0
 DEFAULT_BYTE_DELAY_S = 0.02
+DEFAULT_LOAD_ADDR = 0x2000
 
-CAS_FIXED_BASE = 0x0010  # fixed (validated)
+CAS_FIXED_BASE = 0x0010  # fixed (validated for SEND)
+SAVE_IDLE_TIMEOUT_S = 1.25  # end capture if no bytes for this duration (after any data received)
 
 
 # ---------- X-07 key codes ----------
@@ -59,6 +61,29 @@ def guess_name_in_first_16_bytes(data: bytes, fallback: str) -> str:
     txt = "".join(chr(b) if 0x20 <= b <= 0x7E else " " for b in data[:0x10])
     tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9 _\-\[\]]{2,24}", txt)
     return max(tokens, key=len).strip() if tokens else fallback
+
+
+def build_cas_header_from_filename(path: Path) -> bytes:
+    """
+    Canon X-07 .CAS header (empirical, per your samples):
+      - 10 bytes: 0xD3 repeated
+      - 6 bytes : ASCII name (max 6 chars), padded with 0x00
+    Total = 16 bytes (0x0010)
+
+    We take the destination filename stem, sanitize to [A-Z0-9_], uppercase, truncate to 6.
+    """
+    name = (path.stem or "").upper()
+
+    safe = []
+    for ch in name:
+        if ("A" <= ch <= "Z") or ("0" <= ch <= "9"):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    name = "".join(safe)[:6]  # max 6
+    name_field = name.encode("ascii", errors="replace").ljust(6, b"\x00")
+
+    return (b"\xD3" * 10) + name_field
 
 
 class AutoScrollFrame(ttk.Frame):
@@ -225,7 +250,7 @@ class X07LoaderApp(tk.Tk):
         right.pack(side="left", fill="both", expand=True, padx=(6, 0))
 
         # CAS/K7 (LEFT)
-        cas = ttk.LabelFrame(left, text='Cassette stream (.cas/.k7) via LOAD "COM:" (raw bytes)', padding=6)
+        cas = ttk.LabelFrame(left, text='Cassette stream (.cas/.k7) via LOAD "COM:" / SAVE "COM:" (raw bytes)', padding=6)
         cas.pack(fill="both", expand=True)
 
         self.lbl_cas = ttk.Label(cas, text="Selected CAS/K7: (none)")
@@ -240,12 +265,15 @@ class X07LoaderApp(tk.Tk):
         btn_inspect.pack(side="left", padx=(6, 0))
         self._always_enabled_controls.append(btn_inspect)
 
-        btn_send_cas = ttk.Button(rc, text="Send raw stream", command=self.send_cas_raw)
+        btn_send_cas = ttk.Button(rc, text='Send raw (LOAD "COM:")', command=self.send_cas_raw)
         btn_send_cas.pack(side="left", padx=(6, 0))
         self._transfer_controls.append(btn_send_cas)
 
-        ttk.Label(rc, text='(X-07: LOAD"COM:" then RETURN)').pack(side="left", padx=(10, 0))
-        ttk.Label(cas, text="Fixed send base: 0x0010 (validated).").pack(anchor="w", pady=(4, 0))
+        btn_recv_cas = ttk.Button(rc, text='Receive raw (SAVE "COM:")', command=self.receive_cas_raw)
+        btn_recv_cas.pack(side="left", padx=(6, 0))
+        self._transfer_controls.append(btn_recv_cas)
+
+        ttk.Label(cas, text="Send base: fixed 0x0010 (validated). Receive: saves as CAS with D3 header + stream.").pack(anchor="w", pady=(4, 0))
 
         # TXT/BAS (RIGHT)
         txt = ttk.LabelFrame(right, text="Text listing (.txt/.bas) via SLAVE mode", padding=6)
@@ -267,7 +295,7 @@ class X07LoaderApp(tk.Tk):
         asm = ttk.LabelFrame(main, text="ASM via SLAVE mode", padding=6)
         asm.pack(fill="x", pady=(0, 6))
 
-        self.var_addr = tk.StringVar(value="0x1000")
+        self.var_addr = tk.StringVar(value=hex(DEFAULT_LOAD_ADDR))
         self.var_append_run = tk.BooleanVar(value=True)
 
         self.lbl_bin = ttk.Label(asm, text="Selected ASM binary: (none)")
@@ -314,7 +342,6 @@ class X07LoaderApp(tk.Tk):
             self._kbd_controls.append(b)
             return b
 
-        # Buttons: codes
         kbtn("HOME",  lambda: self._kbd_send_byte(KEY_HOME))
         kbtn("CLR",   lambda: self._kbd_send_byte(KEY_CLR), width=5)
         kbtn("INS",   lambda: self._kbd_send_byte(KEY_INS), width=5)
@@ -323,9 +350,9 @@ class X07LoaderApp(tk.Tk):
 
         ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
 
-        # Macros
         def macro(label: str, text: str, w=4):
-            b = ttk.Button(row_btns, text=label, width=w, command=lambda: self._kbd_send_bytes(text.encode("ascii", errors="replace")))
+            b = ttk.Button(row_btns, text=label, width=w,
+                           command=lambda: self._kbd_send_bytes(text.encode("ascii", errors="replace")))
             b.pack(side="left", padx=(2, 0))
             self._kbd_controls.append(b)
 
@@ -342,7 +369,6 @@ class X07LoaderApp(tk.Tk):
 
         ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
 
-        # Arrows (same line)
         kbtn("←", lambda: self._kbd_send_byte(KEY_LEFT), width=3)
         kbtn("↑", lambda: self._kbd_send_byte(KEY_UP), width=3)
         kbtn("↓", lambda: self._kbd_send_byte(KEY_DOWN), width=3)
@@ -370,7 +396,6 @@ class X07LoaderApp(tk.Tk):
         self.txt = tk.Text(bottom, height=12, wrap="word")
         self.txt.pack(fill="both", expand=True, pady=(4, 0))
 
-        # Start with keyboard controls disabled (OFF)
         self._set_keyboard_controls_enabled(False)
 
     # ---------------- Logging ----------------
@@ -385,7 +410,7 @@ class X07LoaderApp(tk.Tk):
     def _log_startup_banner(self):
         self.log("Canon X-07 Serial Fast Loader - ready.")
         self.log('SLAVE mode (BASIC TXT + ASM + REMOTE KEYBOARD): INIT#5,"COM:" then EXEC&HEE1F (user guide p.119).')
-        self.log('CAS/K7 raw stream: use LOAD"COM:" on X-07, then send raw bytes from PC.')
+        self.log('CAS/K7 raw stream: use LOAD"COM:" or SAVE"COM:" on X-07, then send/receive raw bytes on PC.')
         self.log("Exit slave: EXEC&HEE33 (remote) or power cycle.")
         self.log("")
 
@@ -441,7 +466,6 @@ class X07LoaderApp(tk.Tk):
             self.job_running = True
         self.cancel_event.clear()
 
-        # Disable remote keyboard during transfers
         if self.remote_kbd_on:
             self._remote_keyboard_off(reason="[WARN] Remote keyboard disabled during transfer.")
 
@@ -454,7 +478,6 @@ class X07LoaderApp(tk.Tk):
             self.job_running = False
         self.after(0, lambda: self.btn_cancel.config(state="disabled"))
         self.after(0, lambda: self._set_controls_enabled(True))
-        # remote keyboard remains OFF after a transfer (safe)
         self.after(0, lambda: self._set_keyboard_controls_enabled(False))
 
     def _set_status(self, text: str):
@@ -493,7 +516,6 @@ class X07LoaderApp(tk.Tk):
         return p
 
     def _open_for_typing(self) -> serial.Serial:
-        # BASIC typing / CAS raw / remote keyboard: 8N2
         return serial.Serial(
             self._require_port(),
             int(self.var_typing_baud.get()),
@@ -505,7 +527,6 @@ class X07LoaderApp(tk.Tk):
         )
 
     def _switch_to_xfer(self, ser: serial.Serial):
-        # ASM xfer: 7E1
         ser.baudrate = int(self.var_xfer_baud.get())
         ser.bytesize = serial.SEVENBITS
         ser.parity = serial.PARITY_EVEN
@@ -624,15 +645,15 @@ class X07LoaderApp(tk.Tk):
         append_run = self.var_append_run.get()
         lines = [
             "NEW",
-            "1 EXEC&HEE33",
-            f"2 Z=&H{addr:04X}",
-            f'3 INIT#1,"COM:",{xfer_baud},"G',
-            "4 INPUT#1,N",
-            "5 FORI=0TO N-1",
-            "6 INPUT#1,A$",
-            "7 POKE Z+I,VAL(A$)",
-            "8 NEXT I",
-            "9 EXECZ",
+            "1EXEC&HEE33",
+            f"2Z=&H{addr:04X}",
+            f'3INIT#1,"COM:",{xfer_baud},"G',
+            "4INPUT#1,N",
+            "5FORI=0TO N-1",
+            "6INPUT#1,A$",
+            "7POKE Z+I,VAL(A$)",
+            "8NEXT I",
+            "9EXECZ",
         ]
         if append_run:
             lines.append("RUN")
@@ -816,13 +837,83 @@ class X07LoaderApp(tk.Tk):
                     ser.flush()
                     sent = end
                     if sent == total or (sent % 4096 == 0):
-                        self._set_progress((sent / total) * 100.0, f"CAS/K7 {sent}/{total} bytes")
+                        self._set_progress((sent / total) * 100.0, f'CAS/K7 send {sent}/{total} bytes')
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
-        self._set_progress(100.0, "CAS/K7 done")
+        self._set_progress(100.0, "CAS/K7 send done")
         self.log("[INFO] CAS/K7 raw transfer finished.")
+
+    def receive_cas_raw(self):
+        p = filedialog.asksaveasfilename(
+            title='Save received stream as (.cas)',
+            defaultextension=".cas",
+            filetypes=[("CAS", "*.cas"), ("All files", "*.*")]
+        )
+        if not p:
+            return
+        out_path = Path(p)
+        self._run_threaded(lambda: self._receive_cas_raw_impl(out_path), 'Receive CAS/K7 raw stream (SAVE"COM:")')
+
+    def _receive_cas_raw_impl(self, out_path: Path):
+        self._set_status("receiving CAS/K7 raw bytes")
+        self._set_progress(0, "waiting for data...")
+
+        self.log(f'[INFO] PC ready to receive into: {out_path}')
+        self.log('[INFO] X-07 side: type SAVE"COM:" (optionally with a name) then press RETURN.')
+        self.log(f"[INFO] Capture ends after ~{SAVE_IDLE_TIMEOUT_S:.2f}s of inactivity.")
+
+        header = build_cas_header_from_filename(out_path)
+
+        buf = bytearray()
+        got_any = False
+        last_rx = time.time()
+
+        try:
+            with self._open_for_typing() as ser:
+                ser.timeout = 0.2
+                while True:
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Cancelled during CAS/K7 receive.")
+
+                    chunk = ser.read(4096)
+                    if chunk:
+                        buf.extend(chunk)
+                        got_any = True
+                        last_rx = time.time()
+
+                        if len(buf) == len(chunk) or (len(buf) % 4096 == 0):
+                            self._set_progress(0.0, f"CAS/K7 recv {len(buf)} bytes")
+                    else:
+                        if got_any and (time.time() - last_rx) >= SAVE_IDLE_TIMEOUT_S:
+                            break
+
+        except InterruptedError:
+            if buf:
+                try:
+                    out_path.write_bytes(header + bytes(buf))
+                    self.log(f"[WARN] Partial stream saved ({len(buf)} bytes).")
+                except Exception as e:
+                    self.log(f"[ERROR] Failed to save partial stream: {e}")
+            raise
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
+
+        if not buf:
+            self.log("[WARN] No data received. Did SAVE\"COM:\" start?")
+            self._set_progress(0.0, "no data")
+            return
+
+        try:
+            out_path.write_bytes(header + bytes(buf))
+        except Exception as e:
+            self.log(f"[ERROR] Failed to save file: {e}")
+            return
+
+        self._set_progress(100.0, f"CAS/K7 recv done ({len(buf)} bytes)")
+        self.log(f"[OK] Received {len(buf)} bytes. Saved: {out_path.name}")
 
     # ---------------- Remote keyboard ----------------
     def toggle_remote_keyboard(self):
@@ -887,7 +978,6 @@ class X07LoaderApp(tk.Tk):
             self._remote_keyboard_off(reason="[WARN] REMOTE KEYBOARD stopped (write error).")
 
     def _on_remote_keypress(self, event):
-        # Only send if remote keyboard ON; always block local text insertion
         if not self.remote_kbd_on:
             return "break"
 

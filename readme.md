@@ -11,7 +11,7 @@ Cet outil, basé sur une interface graphique **Tkinter**, permet de transférer 
 Il prend en charge :
 
 * **BASIC (listing texte)** : envoi d’un fichier `.txt` / `.bas` en le « tapant » ligne par ligne.
-* **BASIC (cassette en flux brut)** : envoi d’un fichier `.cas` / `.k7` comme un flux d’octets via `LOAD"COM:"`.
+* **BASIC (cassette en flux brut)** : envoi *et* réception d’un fichier `.cas` / `.k7` comme un flux d’octets via `LOAD"COM:"` et `SAVE"COM:"`.
 * **ASM (rapide)** : envoi d’un petit loader BASIC, puis transfert accéléré d’un binaire `.bin`.
 * **Clavier distant (REMOTE KEYBOARD)** : saisie depuis le PC et envoi immédiat des frappes / touches spéciales vers le X-07.
 
@@ -42,7 +42,7 @@ L’application fournit :
 
 ```bash
 python x07_loader.pyw
-```
+````
 
 1. Sélectionner le **port COM** dans *Serial settings*.
 2. Ajuster si besoin :
@@ -116,9 +116,11 @@ Fonctionnement :
 
 ---
 
-### 2) BASIC cassette stream (.cas / .k7) via LOAD "COM:" (raw bytes)
+### 2) BASIC cassette stream (.cas / .k7) via LOAD "COM:" / SAVE "COM:" (raw bytes)
 
-Objectif : envoyer un fichier cassette en flux brut, comme si le X-07 lisait une cassette depuis `COM:`.
+Objectif : échanger un programme “cassette” sous forme de flux d’octets via le port série, sans mode *slave*.
+
+#### a) Envoyer un flux (PC → X-07) avec `LOAD"COM:"`
 
 Côté Canon X-07 :
 
@@ -137,13 +139,42 @@ Côté PC :
 
    * **Select .cas/.k7…**
    * (optionnel) **Inspect header**
-   * **Send raw stream**
+   * **Send raw (LOAD "COM:")**
 
 Notes importantes :
 
 * L’envoi est réalisé en **8N2**.
 * Le point de départ d’envoi est **fixe** : le transfert commence à l’offset **`0x0010`** du fichier (base validée).
 * Le bouton **Inspect header** affiche uniquement un **preview @0x0000** (aide au diagnostic / comparaison de fichiers).
+
+#### b) Recevoir un flux (X-07 → PC) avec `SAVE"COM:"`
+
+Côté Canon X-07 :
+
+1. **Ne pas** être en mode slave.
+2. Lancer la commande :
+
+```basic
+SAVE"COM:"
+```
+
+(ou `SAVE"COM:nom"` selon vos habitudes), puis **RETURN**.
+
+Côté PC :
+
+1. Dans la section **Cassette stream (.cas/.k7)** :
+
+   * **Receive raw (SAVE "COM:")**
+   * choisir le fichier de destination `.cas`
+
+Fonctionnement :
+
+* la capture se fait en **8N2**,
+* l’enregistrement se termine automatiquement après une courte période d’inactivité (timeout),
+* le fichier `.cas` enregistré côté PC contient :
+
+  * un **header 16 octets** (10×`D3` + **nom sur 6 caractères** issu du nom de fichier, tronqué/paddé),
+  * suivi du **flux brut** reçu depuis le X-07.
 
 ---
 
@@ -181,7 +212,7 @@ Le champ **Load addr** définit l’adresse mémoire où le binaire `.bin` est c
 Exemple :
 
 ```asm
-ORG $1800
+ORG $2000
 ```
 
 Si le binaire est copié à une autre adresse que celle prévue (ORG), alors :
@@ -245,6 +276,12 @@ Sécurité :
 
   * vérifier que l’envoi est déclenché après le RETURN côté X-07,
   * vérifier la cohérence du fichier et l’offset d’envoi (0x0010).
+* **SAVE"COM:" ne génère rien côté PC** :
+
+  * vérifier que vous n’êtes pas en mode *slave*,
+  * cliquer sur **Receive raw (SAVE "COM:")** avant de lancer `SAVE"COM:"`,
+  * vérifier le câblage et la vitesse **Typing baud (8N2)**,
+  * si le programme est très court, augmenter légèrement le timeout de capture côté PC (valeur interne).
 
 ---
 
@@ -257,7 +294,7 @@ This tool, built with a **Tkinter** GUI, transfers programs to a **Canon X-07** 
 It supports:
 
 * **BASIC (text listing)**: sends a `.txt` / `.bas` file by “typing” it line by line.
-* **BASIC (cassette raw stream)**: sends a `.cas` / `.k7` file as raw bytes via `LOAD"COM:"`.
+* **BASIC (cassette raw stream)**: sends *and* receives `.cas` / `.k7` files as raw bytes using `LOAD"COM:"` and `SAVE"COM:"`.
 * **ASM (fast)**: types a small BASIC loader, then transfers a `.bin` much faster.
 * **Remote keyboard (REMOTE KEYBOARD)**: sends PC keystrokes and special keys to the X-07.
 
@@ -362,9 +399,11 @@ How it works:
 
 ---
 
-### 2) BASIC cassette stream (.cas / .k7) via LOAD "COM:" (raw bytes)
+### 2) BASIC cassette stream (.cas / .k7) via LOAD "COM:" / SAVE "COM:" (raw bytes)
 
-Goal: send a cassette file as a raw byte stream, as if the X-07 was reading from `COM:`.
+Goal: exchange “cassette-style” programs as a raw byte stream over the serial port (no slave mode).
+
+#### a) Sending a stream (PC → X-07) using `LOAD"COM:"`
 
 On the Canon X-07:
 
@@ -383,13 +422,42 @@ On the PC:
 
    * **Select .cas/.k7…**
    * (optional) **Inspect header**
-   * **Send raw stream**
+   * **Send raw (LOAD "COM:")**
 
 Important notes:
 
 * streaming uses **8N2**.
 * the send base is **fixed**: sending starts at file offset **`0x0010`** (validated).
 * **Inspect header** shows only a **preview @0x0000** (useful for comparison / diagnostics).
+
+#### b) Receiving a stream (X-07 → PC) using `SAVE"COM:"`
+
+On the Canon X-07:
+
+1. Do **not** use slave mode.
+2. Run:
+
+```basic
+SAVE"COM:"
+```
+
+(or `SAVE"COM:name"` if you prefer), then press **RETURN**.
+
+On the PC:
+
+1. In **Cassette stream (.cas/.k7)**:
+
+   * click **Receive raw (SAVE "COM:")**
+   * choose an output `.cas` file
+
+How it works:
+
+* capture is performed in **8N2**,
+* saving stops automatically after a short inactivity timeout,
+* the saved `.cas` file contains:
+
+  * a **16-byte header** (10×`D3` + a **6-character name** derived from the output filename, truncated/padded),
+  * followed by the **raw stream** received from the X-07.
 
 ---
 
@@ -427,7 +495,7 @@ Steps:
 Example:
 
 ```asm
-ORG $1800
+ORG $2000
 ```
 
 If the binary is copied to a different address than the one assumed by `ORG`, then:
@@ -491,3 +559,9 @@ Safety:
 
   * ensure streaming starts after pressing RETURN on the X-07,
   * verify the file and the send offset (0x0010).
+* **SAVE"COM:" produces no file content on PC**:
+
+  * make sure you are not in *slave* mode,
+  * click **Receive raw (SAVE "COM:")** before running `SAVE"COM:"`,
+  * check wiring and **Typing baud (8N2)**,
+  * if the program is very short, you may need a slightly longer capture timeout (internal value).
