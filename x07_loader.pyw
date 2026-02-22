@@ -2,10 +2,13 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
 import time
+import os
 from pathlib import Path
 import sys
 import subprocess
 import re
+import configparser
+from pathlib import Path
 
 try:
     import serial
@@ -45,13 +48,13 @@ KEY_LEFT     = 0x1D
 KEY_UP       = 0x1E
 KEY_DOWN     = 0x1F
 
-
 def list_serial_ports():
-    try:
-        return [p.device for p in serial.tools.list_ports.comports()]
-    except Exception:
-        return []
-
+    ports = [p.device for p in serial.tools.list_ports.comports()]
+    if sys.platform == "darwin":
+        cu_ports = [p for p in ports if p.startswith("/dev/cu.")]
+        if cu_ports:
+            return cu_ports
+    return ports
 
 def guess_name_in_first_16_bytes(data: bytes, fallback: str) -> str:
     """Best-effort: try to read an ASCII-ish name from first 16 bytes."""
@@ -190,6 +193,7 @@ class X07LoaderApp(tk.Tk):
         serial_box.pack(fill="x", pady=(0, 6))
 
         self.var_port = tk.StringVar(value="")
+        self.var_port.trace_add("write", lambda *_: self._save_last_port(self.var_port.get()))
         self.var_typing_baud = tk.IntVar(value=4800)   # 8N2
         self.var_xfer_baud = tk.IntVar(value=8000)     # 7E1
 
@@ -350,22 +354,22 @@ class X07LoaderApp(tk.Tk):
 
         ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
 
-        def macro(label: str, text: str, w=4):
+        def macro(label: str, text: str, w=7):
             b = ttk.Button(row_btns, text=label, width=w,
                            command=lambda: self._kbd_send_bytes(text.encode("ascii", errors="replace")))
             b.pack(side="left", padx=(2, 0))
             self._kbd_controls.append(b)
 
-        macro("F1",  "?TIME$\r")
-        macro("F2",  'CLOAD"\r')
-        macro("F3",  "LOCATE ")
-        macro("F4",  "LIST ")
-        macro("F5",  "RUN\r")
-        macro("F6",  "?DATE$\r")
-        macro("F7",  'CSAVE"\r')
-        macro("F8",  "PRINT ")
-        macro("F9",  "SLEEP")
-        macro("F10", "CONT\r", w=5)
+        macro("?TIME$",  "?TIME$\r")
+        macro("?DATE$",  "?DATE$\r")
+        macro("CLOAD",  'CLOAD"\r')
+        macro("CSAVE",  'CSAVE"\r')
+        macro("LOCATE",  "LOCATE ")
+        macro("PRINT",  "PRINT ")
+        macro("LIST",  "LIST ")
+        macro("RUN",  "RUN\r")
+        macro("SLEEP",  "SLEEP")
+        macro("CONT", "CONT\r")
 
         ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
 
@@ -438,14 +442,50 @@ class X07LoaderApp(tk.Tk):
                 pass
 
     # ---------------- Ports ----------------
+
+    def _config_path(self) -> Path:
+        return Path(__file__).with_suffix(".ini")  # x07_loader.ini
+
+    def _load_last_port(self) -> str | None:
+        cfg_path = self._config_path()
+        if not cfg_path.exists():
+            return None
+
+        cfg = configparser.ConfigParser()
+        try:
+            cfg.read(cfg_path, encoding="utf-8")
+            port = cfg.get("serial", "port", fallback="").strip()
+            return port or None
+        except Exception:
+            return None
+
+    def _save_last_port(self, port: str) -> None:
+        cfg_path = self._config_path()
+        cfg = configparser.ConfigParser()
+        cfg["serial"] = {"port": port}
+
+        try:
+            with cfg_path.open("w", encoding="utf-8") as f:
+                cfg.write(f)
+        except Exception:
+            pass
+
     def refresh_ports(self, initial=False):
         ports = list_serial_ports()
         self.cbo_port["values"] = ports
+
         cur = (self.var_port.get() or "").strip()
-        if cur in ports:
-            self.var_port.set(cur)
+        last = (self._load_last_port() or "").strip()
+
+        if cur and cur in ports:
+            chosen = cur
+        elif last and last in ports:
+            chosen = last
         else:
-            self.var_port.set(ports[0] if ports else "")
+            chosen = ports[0] if ports else ""
+
+        self.var_port.set(chosen)
+
         if initial:
             if ports:
                 self.log(f"[INFO] COM ports loaded: {', '.join(ports[:10])}{'...' if len(ports) > 10 else ''}")
@@ -811,6 +851,18 @@ class X07LoaderApp(tk.Tk):
             return
         self._run_threaded(self._send_cas_raw_impl, 'Send CAS/K7 raw stream (LOAD"COM:")')
 
+
+    def receive_cas_raw(self):
+        p = filedialog.asksaveasfilename(
+            title='Save received stream as (.cas)',
+            defaultextension=".cas",
+            filetypes=[("CAS", "*.cas"), ("All files", "*.*")]
+        )
+        if not p:
+            return
+        out_path = Path(p)
+        self._run_threaded(lambda: self._receive_cas_raw_impl(out_path), 'Receive CAS/K7 raw stream (SAVE"COM:")')
+
     def _send_cas_raw_impl(self):
         self._set_status("sending CAS/K7 raw bytes")
         self._set_progress(0, "starting...")
@@ -826,19 +878,34 @@ class X07LoaderApp(tk.Tk):
         self.log(f'[INFO] Sending raw bytes from base=0x{base:04X} (len={len(payload)}).')
         self.log('[INFO] X-07 side: LOAD"COM:" then press RETURN.')
 
-
         total = len(payload)
+        if total <= 0:
+            raise ValueError("Empty CAS payload")
 
         is_darwin = (sys.platform == "darwin")
 
-        # Réglages "safe" pour macOS (à ajuster si besoin)
-        CHUNK = 128 if is_darwin else 512
-        CHUNK_SLEEP = 0.002 if is_darwin else 0.0   # 2 ms entre chunks
-        PAUSE_EVERY = 4096 if is_darwin else 0       # pause toutes les 4 KB
-        PAUSE_SLEEP = 0.02 if is_darwin else 0.0     # 20 ms
+        # --- macOS pacing (no flush in the loop) ---
+        CHUNK = 64 if is_darwin else 512
+        CHUNK_SLEEP = 0.004 if is_darwin else 0.0      # 4ms between chunks on macOS
+        PAUSE_EVERY = 4096 if is_darwin else 0          # or 2048 for extra safety
+        PAUSE_SLEEP = 0.03 if is_darwin else 0.0        # 30ms
+
+        # --- end-of-program marker (manual: 13 trailing 0x00) ---
+        END_MARKER = b"\x00" * 13
+        need_append_end = not payload.endswith(END_MARKER)
+
+        # Give the ROM time to notice end-of-stream / timeout after end marker
+        POST_END_SILENCE = 2.5 if is_darwin else 0.8
 
         try:
             with self._open_for_typing() as ser:
+                # Make sure we start clean
+                try:
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception:
+                    pass  # not critical
+
                 sent = 0
                 while sent < total:
                     if self.cancel_event.is_set():
@@ -846,102 +913,32 @@ class X07LoaderApp(tk.Tk):
 
                     end = min(total, sent + CHUNK)
                     ser.write(payload[sent:end])
-                    ser.flush()
                     sent = end
 
-                    # pacing macOS
-                    if CHUNK_SLEEP > 0:
+                    # pacing to avoid USB-serial "bursts" (especially on macOS)
+                    if CHUNK_SLEEP:
                         time.sleep(CHUNK_SLEEP)
                     if PAUSE_EVERY and (sent % PAUSE_EVERY == 0):
                         time.sleep(PAUSE_SLEEP)
 
                     if sent == total or (sent % 4096 == 0):
-                        self._set_progress((sent / total) * 100.0, f'CAS/K7 send {sent}/{total} bytes')
+                        self._set_progress((sent / total) * 100.0, f"CAS/K7 send {sent}/{total} bytes")
 
-                # --- fin de transfert robuste ---
-                ser.flush()
-                time.sleep(0.25)
+                # Append end marker ONLY if missing
+                if need_append_end:
+                    ser.write(END_MARKER)
+                    if is_darwin:
+                        time.sleep(0.05)  # let the end marker "settle" in USB buffers
 
-                # Force le marqueur de fin X-07 (13 octets à 0x00, manuel p.121)
-                ser.write(b"\x00" * 13)
-                ser.flush()
-                time.sleep(0.25)
+                # do NOT rely on flush() tcdrain here; enforce silence instead
+                time.sleep(POST_END_SILENCE)
+
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
         self._set_progress(100.0, "CAS/K7 send done")
         self.log("[INFO] CAS/K7 raw transfer finished.")
-
-    def receive_cas_raw(self):
-        p = filedialog.asksaveasfilename(
-            title='Save received stream as (.cas)',
-            defaultextension=".cas",
-            filetypes=[("CAS", "*.cas"), ("All files", "*.*")]
-        )
-        if not p:
-            return
-        out_path = Path(p)
-        self._run_threaded(lambda: self._receive_cas_raw_impl(out_path), 'Receive CAS/K7 raw stream (SAVE"COM:")')
-
-    def _receive_cas_raw_impl(self, out_path: Path):
-        self._set_status("receiving CAS/K7 raw bytes")
-        self._set_progress(0, "waiting for data...")
-
-        self.log(f'[INFO] PC ready to receive into: {out_path}')
-        self.log('[INFO] X-07 side: type SAVE"COM:" (optionally with a name) then press RETURN.')
-        self.log(f"[INFO] Capture ends after ~{SAVE_IDLE_TIMEOUT_S:.2f}s of inactivity.")
-
-        header = build_cas_header_from_filename(out_path)
-
-        buf = bytearray()
-        got_any = False
-        last_rx = time.time()
-
-        try:
-            with self._open_for_typing() as ser:
-                ser.timeout = 0.2
-                while True:
-                    if self.cancel_event.is_set():
-                        raise InterruptedError("Cancelled during CAS/K7 receive.")
-
-                    chunk = ser.read(4096)
-                    if chunk:
-                        buf.extend(chunk)
-                        got_any = True
-                        last_rx = time.time()
-
-                        if len(buf) == len(chunk) or (len(buf) % 4096 == 0):
-                            self._set_progress(0.0, f"CAS/K7 recv {len(buf)} bytes")
-                    else:
-                        if got_any and (time.time() - last_rx) >= SAVE_IDLE_TIMEOUT_S:
-                            break
-
-        except InterruptedError:
-            if buf:
-                try:
-                    out_path.write_bytes(header + bytes(buf))
-                    self.log(f"[WARN] Partial stream saved ({len(buf)} bytes).")
-                except Exception as e:
-                    self.log(f"[ERROR] Failed to save partial stream: {e}")
-            raise
-        except (SerialException, OSError) as e:
-            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
-            return
-
-        if not buf:
-            self.log("[WARN] No data received. Did SAVE\"COM:\" start?")
-            self._set_progress(0.0, "no data")
-            return
-
-        try:
-            out_path.write_bytes(header + bytes(buf))
-        except Exception as e:
-            self.log(f"[ERROR] Failed to save file: {e}")
-            return
-
-        self._set_progress(100.0, f"CAS/K7 recv done ({len(buf)} bytes)")
-        self.log(f"[OK] Received {len(buf)} bytes. Saved: {out_path.name}")
 
     # ---------------- Remote keyboard ----------------
     def toggle_remote_keyboard(self):
