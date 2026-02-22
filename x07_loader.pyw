@@ -523,7 +523,10 @@ class X07LoaderApp(tk.Tk):
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_TWO,
             timeout=0.2,
-            write_timeout=2.0
+            write_timeout=2.0,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
         )
 
     def _switch_to_xfer(self, ser: serial.Serial):
@@ -828,7 +831,7 @@ class X07LoaderApp(tk.Tk):
         try:
             with self._open_for_typing() as ser:
                 sent = 0
-                CHUNK = 512
+                CHUNK = 128  # smaller chunks => more reliable on some macOS USB-serial stacks
                 while sent < total:
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during CAS/K7 transfer.")
@@ -838,6 +841,15 @@ class X07LoaderApp(tk.Tk):
                     sent = end
                     if sent == total or (sent % 4096 == 0):
                         self._set_progress((sent / total) * 100.0, f'CAS/K7 send {sent}/{total} bytes')
+
+                # --- Ensure end-of-transfer really reaches the Canon before closing ---
+                ser.flush()
+                time.sleep(0.25)
+
+                # Force end marker (13 x 0x00) per manual (harmless if already present)
+                ser.write(b"\x00" * 13)
+                ser.flush()
+                time.sleep(0.25)
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
