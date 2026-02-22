@@ -863,6 +863,65 @@ class X07LoaderApp(tk.Tk):
         out_path = Path(p)
         self._run_threaded(lambda: self._receive_cas_raw_impl(out_path), 'Receive CAS/K7 raw stream (SAVE"COM:")')
 
+    def _receive_cas_raw_impl(self, out_path: Path):
+        self._set_status("receiving CAS/K7 raw bytes")
+        self._set_progress(0, "waiting for data...")
+
+        self.log(f'[INFO] PC ready to receive into: {out_path}')
+        self.log('[INFO] X-07 side: type SAVE"COM:" (optionally with a name) then press RETURN.')
+        self.log(f"[INFO] Capture ends after ~{SAVE_IDLE_TIMEOUT_S:.2f}s of inactivity.")
+
+        header = build_cas_header_from_filename(out_path)
+
+        buf = bytearray()
+        got_any = False
+        last_rx = time.time()
+
+        try:
+            with self._open_for_typing() as ser:
+                ser.timeout = 0.2
+                while True:
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Cancelled during CAS/K7 receive.")
+
+                    chunk = ser.read(4096)
+                    if chunk:
+                        buf.extend(chunk)
+                        got_any = True
+                        last_rx = time.time()
+
+                        if len(buf) == len(chunk) or (len(buf) % 4096 == 0):
+                            self._set_progress(0.0, f"CAS/K7 recv {len(buf)} bytes")
+                    else:
+                        if got_any and (time.time() - last_rx) >= SAVE_IDLE_TIMEOUT_S:
+                            break
+
+        except InterruptedError:
+            if buf:
+                try:
+                    out_path.write_bytes(header + bytes(buf))
+                    self.log(f"[WARN] Partial stream saved ({len(buf)} bytes).")
+                except Exception as e:
+                    self.log(f"[ERROR] Failed to save partial stream: {e}")
+            raise
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
+
+        if not buf:
+            self.log("[WARN] No data received. Did SAVE\"COM:\" start?")
+            self._set_progress(0.0, "no data")
+            return
+
+        try:
+            out_path.write_bytes(header + bytes(buf))
+        except Exception as e:
+            self.log(f"[ERROR] Failed to save file: {e}")
+            return
+
+        self._set_progress(100.0, f"CAS/K7 recv done ({len(buf)} bytes)")
+        self.log(f"[OK] Received {len(buf)} bytes. Saved: {out_path.name}")
+
     def _send_cas_raw_impl(self):
         self._set_status("sending CAS/K7 raw bytes")
         self._set_progress(0, "starting...")
