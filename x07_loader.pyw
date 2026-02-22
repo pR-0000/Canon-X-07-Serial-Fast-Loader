@@ -558,7 +558,7 @@ class X07LoaderApp(tk.Tk):
     def pick_basic(self):
         p = filedialog.askopenfilename(
             title="Select BASIC program (.txt/.bas)",
-            filetypes=[("BASIC text", "*.txt *.bas"), ("All files", "*.*")]
+            filetypes=[("BASIC", "*.txt *.TXT *.bas *.BAS"), ("All files", "*.*")]
         )
         if not p:
             return
@@ -569,7 +569,7 @@ class X07LoaderApp(tk.Tk):
     def pick_bin(self):
         p = filedialog.askopenfilename(
             title="Select ASM binary (.bin)",
-            filetypes=[("Binary", "*.bin"), ("All files", "*.*")]
+            filetypes=[("Binary", "*.bin *.BIN"), ("All files", "*.*")]
         )
         if not p:
             return
@@ -580,7 +580,7 @@ class X07LoaderApp(tk.Tk):
     def pick_cas(self):
         p = filedialog.askopenfilename(
             title="Select CAS/K7",
-            filetypes=[("CAS/K7", "*.cas *.k7"), ("All files", "*.*")]
+            filetypes=[("CAS/K7", "*.cas *.CAS *.k7 *.K7"), ("All files", "*.*")]
         )
         if not p:
             return
@@ -826,27 +826,43 @@ class X07LoaderApp(tk.Tk):
         self.log(f'[INFO] Sending raw bytes from base=0x{base:04X} (len={len(payload)}).')
         self.log('[INFO] X-07 side: LOAD"COM:" then press RETURN.')
 
+
         total = len(payload)
+
+        is_darwin = (sys.platform == "darwin")
+
+        # Réglages "safe" pour macOS (à ajuster si besoin)
+        CHUNK = 128 if is_darwin else 512
+        CHUNK_SLEEP = 0.002 if is_darwin else 0.0   # 2 ms entre chunks
+        PAUSE_EVERY = 4096 if is_darwin else 0       # pause toutes les 4 KB
+        PAUSE_SLEEP = 0.02 if is_darwin else 0.0     # 20 ms
 
         try:
             with self._open_for_typing() as ser:
                 sent = 0
-                CHUNK = 128  # smaller chunks => more reliable on some macOS USB-serial stacks
                 while sent < total:
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during CAS/K7 transfer.")
+
                     end = min(total, sent + CHUNK)
                     ser.write(payload[sent:end])
                     ser.flush()
                     sent = end
+
+                    # pacing macOS
+                    if CHUNK_SLEEP > 0:
+                        time.sleep(CHUNK_SLEEP)
+                    if PAUSE_EVERY and (sent % PAUSE_EVERY == 0):
+                        time.sleep(PAUSE_SLEEP)
+
                     if sent == total or (sent % 4096 == 0):
                         self._set_progress((sent / total) * 100.0, f'CAS/K7 send {sent}/{total} bytes')
 
-                # --- Ensure end-of-transfer really reaches the Canon before closing ---
+                # --- fin de transfert robuste ---
                 ser.flush()
                 time.sleep(0.25)
 
-                # Force end marker (13 x 0x00) per manual (harmless if already present)
+                # Force le marqueur de fin X-07 (13 octets à 0x00, manuel p.121)
                 ser.write(b"\x00" * 13)
                 ser.flush()
                 time.sleep(0.25)
