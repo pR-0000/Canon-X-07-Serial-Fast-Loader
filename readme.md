@@ -20,7 +20,7 @@ L’application fournit :
 * une console de logs horodatée `[hh:mm:ss]`,
 * une barre de progression commune,
 * un bouton d’annulation pour interrompre proprement un transfert,
-* des boutons de touches spéciales et des macros (F1…F10).
+* des boutons de touches spéciales.
 
 ---
 
@@ -36,13 +36,31 @@ L’application fournit :
 * Canon X-07 fonctionnel
 * Adaptateur USB ↔ série reconnu par le système (port COM sous Windows) ou câblage série conforme pour le X-07 (RX, TX, GND, etc.)
 
+Optionnel :
+
+* câble série avec **contrôle de flux matériel RTS/CTS**
+
+Les adaptateurs USB-UART modernes (FT232, CP2102, CH340…) supportent généralement ces lignes.
+
+⚠️ Particularité du Canon X-07 :
+les lignes **RX et TX utilisent une logique inversée**, alors que **RTS et CTS ne doivent pas être inversés**.
+
+Avec une interface **FT232RL**, cela peut être configuré avec **FT_Prog** :
+
+```
+Invert TXD : ON
+Invert RXD : ON
+Invert RTS : OFF
+Invert CTS : OFF
+```
+
 ---
 
 ### Lancer l’application
 
 ```bash
 python x07_loader.pyw
-````
+```
 
 1. Sélectionner le **port COM** dans *Serial settings*.
 2. Ajuster si besoin :
@@ -52,6 +70,23 @@ python x07_loader.pyw
    * **CHAR(s)** / **LINE(s)** : délais (en secondes) entre caractères / entre lignes lors de la saisie BASIC.
    * **PostINIT(s)** : pause (en secondes) après bascule en mode transfert (7E1).
    * **Byte(s)** : délai (en secondes) entre octets lors de l’envoi ASM (format décimal ligne par ligne).
+   * **RTS/CTS cable** : active le **contrôle de flux matériel RTS/CTS** si votre câble supporte ces lignes.
+
+---
+
+### Utilisation d’un câble RTS/CTS
+
+Lorsque l’option **RTS/CTS cable** est activée :
+
+* la communication série utilise le **hardware flow control RTS/CTS**
+* les temporisations logicielles deviennent inutiles
+* les champs **CHAR(s)**, **LINE(s)**, **PostINIT(s)** et **Byte(s)** sont automatiquement **désactivés (gris)** dans l’interface.
+
+Dans ce mode :
+
+* la synchronisation entre le PC et le Canon X-07 est assurée directement par les lignes matérielles
+* les transferts sont généralement **plus rapides**
+* la communication est **plus fiable**
 
 ---
 
@@ -95,7 +130,7 @@ Le bouton **Disable slave (EXEC&HEE33)** de l’application permet de quitter ce
 
 ---
 
-## BASIC
+# BASIC
 
 ### 1) BASIC texte (.txt / .bas) via SLAVE mode
 
@@ -178,7 +213,7 @@ Fonctionnement :
 
 ---
 
-## ASM via SLAVE mode
+# ASM via SLAVE mode
 
 Objectif : transférer rapidement un binaire assembleur `.bin`.
 
@@ -225,7 +260,7 @@ peuvent devenir invalides (comportement imprévisible ou crash).
 
 ---
 
-## Remote keyboard via SLAVE mode
+# Remote keyboard via SLAVE mode
 
 Objectif : contrôler le X-07 depuis le PC comme un « terminal » (frappes + touches spéciales).
 
@@ -238,19 +273,7 @@ Fonctionnement :
 
 * Quand **REMOTE KEYBOARD est ON**, l’application ouvre une session série persistante en **8N2**.
 * La zone de saisie envoie directement les caractères ASCII imprimables.
-* Les boutons envoient des **codes de touches** (HOME/CLR/INS/DEL/BREAK/flèches) conformes au X-07.
-* Les touches **F1…F10** envoient des macros :
-
-  * F1 : `?TIME$` + RETURN
-  * F2 : `CLOAD"` + RETURN
-  * F3 : `LOCATE `
-  * F4 : `LIST `
-  * F5 : `RUN` + RETURN
-  * F6 : `?DATE$` + RETURN
-  * F7 : `CSAVE"` + RETURN
-  * F8 : `PRINT `
-  * F9 : `SLEEP`
-  * F10 : `CONT` + RETURN
+* Les boutons envoient des **codes de touches** (HOME/CLR/INS/DEL/BREAK/flèches/etc.) conformes au X-07.
 
 Sécurité :
 
@@ -258,7 +281,7 @@ Sécurité :
 
 ---
 
-## Dépannage
+# Dépannage
 
 * **Aucun port COM visible** : vérifier le branchement de l’adaptateur, l’installation du pilote, puis cliquer sur **Refresh**.
 * **Impossible d’ouvrir un port COM** : essayer un autre port, vérifier que le port n’est pas déjà utilisé par un autre logiciel.
@@ -282,10 +305,15 @@ Sécurité :
   * cliquer sur **Receive raw (SAVE "COM:")** avant de lancer `SAVE"COM:"`,
   * vérifier le câblage et la vitesse **Typing baud (8N2)**,
   * si le programme est très court, augmenter légèrement le timeout de capture côté PC (valeur interne).
+* **Problèmes avec câble RTS/CTS** :
+
+  * vérifier que **RTS et CTS sont correctement croisés**
+  * vérifier que l’option **RTS/CTS cable** est activée
+  * vérifier que l’adaptateur supporte le **hardware flow control**
 
 ---
 
-## 🇬🇧 English
+# 🇬🇧 English
 
 ### Overview
 
@@ -303,7 +331,7 @@ The application provides:
 * a timestamped log console `[hh:mm:ss]`,
 * a single shared progress bar,
 * a cancel button to safely stop an ongoing transfer,
-* special key buttons and function-key macros (F1…F10).
+* special key buttons.
 
 ---
 
@@ -319,9 +347,29 @@ The application provides:
 * A working Canon X-07
 * A USB-to-serial adapter (COM port on Windows) or proper serial wiring for the X-07 (RX, TX, GND, etc.)
 
+Optional:
+
+* a serial cable with **RTS/CTS hardware flow control**
+
+Modern USB-UART adapters (FT232, CP2102, CH340, etc.) usually support these lines.
+
+⚠️ Canon X-07 specific note:
+the **RX and TX signals use inverted logic**, while **RTS and CTS must NOT be inverted**.
+
+With an **FT232RL** interface this can be configured using **FT_Prog**:
+
+```
+Invert TXD : ON
+Invert RXD : ON
+Invert RTS : OFF
+Invert CTS : OFF
+```
+
+Without this inversion the communication may fail or produce transmission errors.
+
 ---
 
-### Running the app
+### Running the application
 
 ```bash
 python x07_loader.pyw
@@ -330,11 +378,28 @@ python x07_loader.pyw
 1. Select the **COM port** in *Serial settings*.
 2. Adjust if needed:
 
-   * **Typing baud (8N2)**: used for BASIC typing, remote keyboard, and cassette streaming.
-   * **Xfer baud (7E1)**: used for fast ASM transfers.
-   * **CHAR(s)** / **LINE(s)**: delays (seconds) between characters / lines when typing BASIC.
-   * **PostINIT(s)**: delay (seconds) after switching to transfer mode (7E1).
-   * **Byte(s)**: delay (seconds) between bytes during ASM sending (decimal byte lines).
+* **Typing baud (8N2)**: used for BASIC typing, remote keyboard, and cassette streaming.
+* **Xfer baud (7E1)**: used for fast ASM transfers.
+* **CHAR(s)** / **LINE(s)**: delays (seconds) between characters / lines when typing BASIC.
+* **PostINIT(s)**: delay (seconds) after switching to transfer mode (7E1).
+* **Byte(s)**: delay (seconds) between bytes during ASM sending (decimal byte lines).
+* **RTS/CTS cable**: enables **RTS/CTS hardware flow control** if your cable supports it.
+
+---
+
+### Using an RTS/CTS cable
+
+When the **RTS/CTS cable** option is enabled:
+
+* the serial connection uses **hardware flow control (RTS/CTS)**
+* software delays are no longer necessary
+* the fields **CHAR(s)**, **LINE(s)**, **PostINIT(s)** and **Byte(s)** are automatically **disabled (greyed out)** in the interface.
+
+In this mode:
+
+* synchronization between the PC and the Canon X-07 is handled by hardware signals
+* transfers are generally **faster**
+* communication becomes **more reliable**
 
 ---
 
@@ -354,7 +419,9 @@ In slave mode:
 * the local X-07 keyboard is ignored,
 * received characters are processed like keyboard input.
 
-#### Entering slave mode
+---
+
+### Entering slave mode
 
 Type on the Canon X-07:
 
@@ -363,7 +430,9 @@ INIT#5,"COM:
 EXEC&HEE1F
 ```
 
-#### Leaving slave mode
+---
+
+### Leaving slave mode
 
 Two options:
 
@@ -378,21 +447,21 @@ The **Disable slave (EXEC&HEE33)** button sends this command directly.
 
 ---
 
-## BASIC
+# BASIC
 
 ### 1) BASIC text (.txt / .bas) via SLAVE mode
 
 Goal: transfer a BASIC text listing by “typing” it as if entered from the keyboard.
 
-Steps:
+Procedure:
 
 1. Put the X-07 into **SLAVE mode**.
-2. In **Text listing (.txt/.bas)**:
+2. In the **Text listing (.txt/.bas)** section:
 
    * **Select .txt/.bas…**
    * **Send BASIC**
 
-How it works:
+Operation:
 
 * lines are sent in **8N2** using **CHAR(s)** and **LINE(s)** delays,
 * at the end, the tool sends `EXEC&HEE33` to release the remote console state (if active).
@@ -401,24 +470,24 @@ How it works:
 
 ### 2) BASIC cassette stream (.cas / .k7) via LOAD "COM:" / SAVE "COM:" (raw bytes)
 
-Goal: exchange “cassette-style” programs as a raw byte stream over the serial port (no slave mode).
+Goal: exchange a “cassette-style” program as a raw byte stream over the serial port, without slave mode.
 
-#### a) Sending a stream (PC → X-07) using `LOAD"COM:"`
+#### a) Sending a stream (PC → X-07) with `LOAD"COM:"`
 
 On the Canon X-07:
 
-1. Do **not** use slave mode.
-2. Run:
+1. **Do not** be in slave mode.
+2. Run the command:
 
 ```basic
 LOAD"COM:"
 ```
 
-3. Press **RETURN** to start waiting for incoming bytes.
+3. Press **RETURN** (the X-07 then waits for incoming bytes).
 
 On the PC:
 
-1. In **Cassette stream (.cas/.k7)**:
+1. In the **Cassette stream (.cas/.k7)** section:
 
    * **Select .cas/.k7…**
    * (optional) **Inspect header**
@@ -426,34 +495,36 @@ On the PC:
 
 Important notes:
 
-* streaming uses **8N2**.
-* the send base is **fixed**: sending starts at file offset **`0x0010`** (validated).
-* **Inspect header** shows only a **preview @0x0000** (useful for comparison / diagnostics).
+* Sending is done in **8N2**.
+* The send starting point is **fixed**: transfer begins at file offset **`0x0010`** (validated base).
+* The **Inspect header** button only displays a **preview @0x0000** (useful for diagnostics and comparison).
 
-#### b) Receiving a stream (X-07 → PC) using `SAVE"COM:"`
+---
+
+#### b) Receiving a stream (X-07 → PC) with `SAVE"COM:"`
 
 On the Canon X-07:
 
-1. Do **not** use slave mode.
-2. Run:
+1. **Do not** be in slave mode.
+2. Run the command:
 
 ```basic
 SAVE"COM:"
 ```
 
-(or `SAVE"COM:name"` if you prefer), then press **RETURN**.
+(or `SAVE"COM:name"` depending on your habits), then press **RETURN**.
 
 On the PC:
 
-1. In **Cassette stream (.cas/.k7)**:
+1. In the **Cassette stream (.cas/.k7)** section:
 
    * click **Receive raw (SAVE "COM:")**
-   * choose an output `.cas` file
+   * choose the destination `.cas` file
 
-How it works:
+Operation:
 
-* capture is performed in **8N2**,
-* saving stops automatically after a short inactivity timeout,
+* capture runs in **8N2**,
+* recording automatically stops after a short inactivity timeout,
 * the saved `.cas` file contains:
 
   * a **16-byte header** (10×`D3` + a **6-character name** derived from the output filename, truncated/padded),
@@ -461,7 +532,7 @@ How it works:
 
 ---
 
-## ASM via SLAVE mode
+# ASM via SLAVE mode
 
 Goal: quickly transfer an ASM binary `.bin`.
 
@@ -471,26 +542,28 @@ Principle:
 2. The loader configures the serial link on the X-07 and expects:
 
    * one line `N` (binary size),
-   * then `N` lines with one **decimal** byte each.
-3. The loader copies bytes to memory at the chosen address, then executes the program.
+   * then `N` lines each containing one **decimal byte**.
+3. The loader copies bytes into memory at the chosen address and executes the program.
 
-Steps:
+Procedure:
 
 1. Put the X-07 into **SLAVE mode**.
 2. In **ASM via SLAVE mode**:
 
    * **Select bin…**
    * set **Load addr**
-   * use either:
+   * choose:
 
      * **Send BASIC fast loader** then **Send ASM (loader running)**, or
      * **One click: loader + ASM**
 
-### ASM load address (Load addr)
+---
 
-**Load addr** is the memory address where the `.bin` is copied.
+### Load address
 
-⚠️ It must match the address used when assembling the program.
+The **Load addr** field defines the memory address where the `.bin` file is copied.
+
+⚠️ This address must match the one used during assembly.
 
 Example:
 
@@ -498,70 +571,67 @@ Example:
 ORG $2000
 ```
 
-If the binary is copied to a different address than the one assumed by `ORG`, then:
+If the binary is copied to a different address than the one defined by `ORG`, then:
 
-* `JP` / `CALL` targets,
-* memory accesses,
+* `JP` / `CALL`
+* memory accesses
 * referenced data
 
 may become invalid (unpredictable behavior or crashes).
 
 ---
 
-## Remote keyboard via SLAVE mode
+# Remote keyboard via SLAVE mode
 
-Goal: control the X-07 from the PC like a “terminal” (typed characters + special keys).
+Goal: control the X-07 from the PC like a “terminal” (keystrokes + special keys).
 
-Pre-requirements:
+Prerequisites:
 
 1. Put the X-07 into **SLAVE mode**.
-2. Toggle **REMOTE KEYBOARD: ON**.
+2. Enable **REMOTE KEYBOARD: ON**.
 
-How it works:
+Operation:
 
-* When **REMOTE KEYBOARD is ON**, the app opens a persistent **8N2** serial session.
-* The text box sends printable ASCII characters.
-* Buttons send X-07 **special key codes** (HOME/CLR/INS/DEL/BREAK/arrows).
-* Function-key buttons send macros:
-
-  * F1: `?TIME$` + RETURN
-  * F2: `CLOAD"` + RETURN
-  * F3: `LOCATE `
-  * F4: `LIST `
-  * F5: `RUN` + RETURN
-  * F6: `?DATE$` + RETURN
-  * F7: `CSAVE"` + RETURN
-  * F8: `PRINT `
-  * F9: `SLEEP`
-  * F10: `CONT` + RETURN
+* When **REMOTE KEYBOARD is ON**, the application opens a persistent **8N2** serial session.
+* The text entry sends printable ASCII characters.
+* Buttons send **special key codes** (HOME/CLR/INS/DEL/BREAK/arrows/etc.).
 
 Safety:
 
-* During transfers (BASIC/ASM/CAS), the remote keyboard is automatically turned off.
+* During transfers (BASIC / ASM / CAS), the remote keyboard is automatically disabled.
 
 ---
 
-## Troubleshooting
+# Troubleshooting
 
-* **No COM port visible**: check adapter connection and driver installation, then click **Refresh**.
+* **No COM port visible**: check the adapter connection and driver installation, then click **Refresh**.
 * **Cannot open a COM port**: try another port and ensure it is not used by another program.
 * **X-07 does not react (BASIC/ASM/REMOTE KEYBOARD)**:
 
-  * ensure the X-07 is in **SLAVE mode**,
-  * check RX / TX / GND wiring,
-  * verify serial parameters (8N2 vs 7E1 depending on the workflow),
-  * adjust **CHAR(s)** / **LINE(s)** for BASIC typing.
+  * ensure the X-07 is in **SLAVE mode**
+  * check RX / TX / GND wiring
+  * verify serial parameters (8N2 vs 7E1 depending on the workflow)
+  * adjust **CHAR(s)** / **LINE(s)** for BASIC typing
 * **Unstable ASM transfer**:
 
-  * increase **PostINIT(s)**,
-  * slightly increase **Byte(s)**.
+  * increase **PostINIT(s)**
+  * slightly increase **Byte(s)**
 * **LOAD"COM:" loads nothing (CAS/K7)**:
 
-  * ensure streaming starts after pressing RETURN on the X-07,
-  * verify the file and the send offset (0x0010).
+  * ensure streaming starts after pressing RETURN on the X-07
+  * verify the file and the send offset (0x0010)
 * **SAVE"COM:" produces no file content on PC**:
 
-  * make sure you are not in *slave* mode,
-  * click **Receive raw (SAVE "COM:")** before running `SAVE"COM:"`,
-  * check wiring and **Typing baud (8N2)**,
-  * if the program is very short, you may need a slightly longer capture timeout (internal value).
+  * make sure you are not in slave mode
+  * click **Receive raw (SAVE "COM:")** before running `SAVE"COM:"`
+  * check wiring and **Typing baud (8N2)**
+  * if the program is very short, increase the capture timeout slightly
+* **RTS/CTS cable issues**:
+
+  * verify that **RTS and CTS are correctly crossed**
+  * ensure the **RTS/CTS cable** option is enabled
+  * ensure your adapter supports **hardware flow control**
+* **Communication errors**:
+
+  * verify that **RX/TX signals are logically inverted**
+  * ensure **RTS/CTS are NOT inverted**

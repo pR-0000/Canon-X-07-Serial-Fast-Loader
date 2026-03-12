@@ -1,14 +1,12 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import threading
-import time
-import os
-from pathlib import Path
-import sys
-import subprocess
-import re
 import configparser
 from pathlib import Path
+import re
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
 try:
     import serial
@@ -31,7 +29,6 @@ DEFAULT_LOAD_ADDR = 0x2000
 CAS_FIXED_BASE = 0x0010  # fixed (validated for SEND)
 SAVE_IDLE_TIMEOUT_S = 1.25  # end capture if no bytes for this duration (after any data received)
 
-
 # ---------- X-07 key codes ----------
 KEY_ON_BREAK = 0x01
 KEY_RETURN   = 0x0D
@@ -48,6 +45,7 @@ KEY_LEFT     = 0x1D
 KEY_UP       = 0x1E
 KEY_DOWN     = 0x1F
 
+
 def list_serial_ports():
     ports = [p.device for p in serial.tools.list_ports.comports()]
     if sys.platform == "darwin":
@@ -56,8 +54,8 @@ def list_serial_ports():
             return cu_ports
     return ports
 
+
 def guess_name_in_first_16_bytes(data: bytes, fallback: str) -> str:
-    """Best-effort: try to read an ASCII-ish name from first 16 bytes."""
     if len(data) < 0x10:
         return fallback
 
@@ -67,14 +65,6 @@ def guess_name_in_first_16_bytes(data: bytes, fallback: str) -> str:
 
 
 def build_cas_header_from_filename(path: Path) -> bytes:
-    """
-    Canon X-07 .CAS header (empirical, per your samples):
-      - 10 bytes: 0xD3 repeated
-      - 6 bytes : ASCII name (max 6 chars), padded with 0x00
-    Total = 16 bytes (0x0010)
-
-    We take the destination filename stem, sanitize to [A-Z0-9_], uppercase, truncate to 6.
-    """
     name = (path.stem or "").upper()
 
     safe = []
@@ -90,13 +80,6 @@ def build_cas_header_from_filename(path: Path) -> bytes:
 
 
 class AutoScrollFrame(ttk.Frame):
-    """
-    Scrollable frame that:
-      - shows scrollbar only when needed
-      - disables mousewheel scroll when not needed
-      - when not scrolling: stretches inner window height to canvas height
-        so the console extends to the bottom.
-    """
     def __init__(self, master):
         super().__init__(master)
         self.canvas = tk.Canvas(self, highlightthickness=0)
@@ -193,7 +176,7 @@ class X07LoaderApp(tk.Tk):
         serial_box.pack(fill="x", pady=(0, 6))
 
         self.var_port = tk.StringVar(value="")
-        self.var_port.trace_add("write", lambda *_: self._save_last_port(self.var_port.get()))
+        self.var_port.trace_add("write", lambda *_: self._save_serial_settings())
         self.var_typing_baud = tk.IntVar(value=4800)   # 8N2
         self.var_xfer_baud = tk.IntVar(value=8000)     # 7E1
 
@@ -201,6 +184,8 @@ class X07LoaderApp(tk.Tk):
         self.var_line = tk.DoubleVar(value=DEFAULT_LINE_DELAY_S)
         self.var_post = tk.DoubleVar(value=DEFAULT_POST_INIT_DELAY_S)
         self.var_byte = tk.DoubleVar(value=DEFAULT_BYTE_DELAY_S)
+        self.var_rtscts = tk.BooleanVar(value=False)
+        self.var_rtscts.trace_add("write", lambda *_: self._save_serial_settings())
 
         r = ttk.Frame(serial_box)
         r.pack(fill="x")
@@ -219,14 +204,33 @@ class X07LoaderApp(tk.Tk):
         ttk.Label(r, text="Xfer baud (7E1):").pack(side="left")
         ttk.Entry(r, textvariable=self.var_xfer_baud, width=7).pack(side="left", padx=(4, 10))
 
-        ttk.Label(r, text="CHAR(s):").pack(side="left")
-        ttk.Entry(r, textvariable=self.var_char, width=6).pack(side="left", padx=(3, 8))
-        ttk.Label(r, text="LINE(s):").pack(side="left")
-        ttk.Entry(r, textvariable=self.var_line, width=6).pack(side="left", padx=(3, 8))
-        ttk.Label(r, text="PostINIT(s):").pack(side="left")
-        ttk.Entry(r, textvariable=self.var_post, width=6).pack(side="left", padx=(3, 8))
-        ttk.Label(r, text="Byte(s):").pack(side="left")
-        ttk.Entry(r, textvariable=self.var_byte, width=6).pack(side="left", padx=(3, 0))
+        self.chk_rtscts = ttk.Checkbutton(
+            r,
+            text="RTS/CTS cable",
+            variable=self.var_rtscts,
+            command=self._update_handshake_ui,
+        )
+        self.chk_rtscts.pack(side="left", padx=(10, 10))
+
+        self.lbl_char = ttk.Label(r, text="CHAR(s):")
+        self.lbl_char.pack(side="left")
+        self.ent_char = ttk.Entry(r, textvariable=self.var_char, width=6)
+        self.ent_char.pack(side="left", padx=(3, 8))
+
+        self.lbl_line = ttk.Label(r, text="LINE(s):")
+        self.lbl_line.pack(side="left")
+        self.ent_line = ttk.Entry(r, textvariable=self.var_line, width=6)
+        self.ent_line.pack(side="left", padx=(3, 8))
+
+        self.lbl_post = ttk.Label(r, text="PostINIT(s):")
+        self.lbl_post.pack(side="left")
+        self.ent_post = ttk.Entry(r, textvariable=self.var_post, width=6)
+        self.ent_post.pack(side="left", padx=(3, 8))
+
+        self.lbl_byte = ttk.Label(r, text="Byte(s):")
+        self.lbl_byte.pack(side="left")
+        self.ent_byte = ttk.Entry(r, textvariable=self.var_byte, width=6)
+        self.ent_byte.pack(side="left", padx=(3, 0))
 
         # cancel/disable slave row
         r2 = ttk.Frame(serial_box)
@@ -260,7 +264,8 @@ class X07LoaderApp(tk.Tk):
         self.lbl_cas = ttk.Label(cas, text="Selected CAS/K7: (none)")
         self.lbl_cas.pack(anchor="w")
 
-        rc = ttk.Frame(cas); rc.pack(fill="x", pady=(4, 0))
+        rc = ttk.Frame(cas)
+        rc.pack(fill="x", pady=(4, 0))
         btn_pick_cas = ttk.Button(rc, text="Select .cas/.k7…", command=self.pick_cas)
         btn_pick_cas.pack(side="left")
         self._transfer_controls.append(btn_pick_cas)
@@ -286,7 +291,8 @@ class X07LoaderApp(tk.Tk):
         self.lbl_basic = ttk.Label(txt, text="Selected BASIC: (none)")
         self.lbl_basic.pack(anchor="w")
 
-        rb = ttk.Frame(txt); rb.pack(fill="x", pady=(4, 0))
+        rb = ttk.Frame(txt)
+        rb.pack(fill="x", pady=(4, 0))
         btn_pick_basic = ttk.Button(rb, text="Select .txt/.bas…", command=self.pick_basic)
         btn_pick_basic.pack(side="left")
         self._transfer_controls.append(btn_pick_basic)
@@ -305,7 +311,8 @@ class X07LoaderApp(tk.Tk):
         self.lbl_bin = ttk.Label(asm, text="Selected ASM binary: (none)")
         self.lbl_bin.pack(anchor="w")
 
-        ra = ttk.Frame(asm); ra.pack(fill="x", pady=(4, 0))
+        ra = ttk.Frame(asm)
+        ra.pack(fill="x", pady=(4, 0))
         btn_pick_bin = ttk.Button(ra, text="Select bin…", command=self.pick_bin)
         btn_pick_bin.pack(side="left")
         self._transfer_controls.append(btn_pick_bin)
@@ -331,14 +338,16 @@ class X07LoaderApp(tk.Tk):
         kbd = ttk.LabelFrame(main, text='Remote keyboard via SLAVE mode (PC -> X-07)', padding=6)
         kbd.pack(fill="x", pady=(0, 6))
 
-        rk = ttk.Frame(kbd); rk.pack(fill="x")
+        rk = ttk.Frame(kbd)
+        rk.pack(fill="x")
         self.btn_remote_toggle = ttk.Button(rk, text="REMOTE KEYBOARD: OFF", command=self.toggle_remote_keyboard)
         self.btn_remote_toggle.pack(side="left")
         self._always_enabled_controls.append(self.btn_remote_toggle)
 
         ttk.Label(rk, text='(requires SLAVE mode: INIT#5,"COM:" then EXEC&HEE1F)').pack(side="left", padx=(10, 0))
 
-        row_btns = ttk.Frame(kbd); row_btns.pack(fill="x", pady=(6, 0))
+        row_btns = ttk.Frame(kbd)
+        row_btns.pack(fill="x", pady=(6, 0))
 
         def kbtn(label: str, cmd, width=6):
             b = ttk.Button(row_btns, text=label, width=width, command=cmd)
@@ -355,21 +364,25 @@ class X07LoaderApp(tk.Tk):
         ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
 
         def macro(label: str, text: str, w=7):
-            b = ttk.Button(row_btns, text=label, width=w,
-                           command=lambda: self._kbd_send_bytes(text.encode("ascii", errors="replace")))
+            b = ttk.Button(
+                row_btns,
+                text=label,
+                width=w,
+                command=lambda: self._kbd_send_bytes(text.encode("ascii", errors="replace")),
+            )
             b.pack(side="left", padx=(2, 0))
             self._kbd_controls.append(b)
 
         macro("?TIME$",  "?TIME$\r")
         macro("?DATE$",  "?DATE$\r")
-        macro("CLOAD",  'CLOAD"\r')
-        macro("CSAVE",  'CSAVE"\r')
+        macro("CLOAD",   'CLOAD"\r')
+        macro("CSAVE",   'CSAVE"\r')
         macro("LOCATE",  "LOCATE ")
-        macro("PRINT",  "PRINT ")
-        macro("LIST",  "LIST ")
-        macro("RUN",  "RUN\r")
-        macro("SLEEP",  "SLEEP")
-        macro("CONT", "CONT\r")
+        macro("PRINT",   "PRINT ")
+        macro("LIST",    "LIST ")
+        macro("RUN",     "RUN\r")
+        macro("SLEEP",   "SLEEP")
+        macro("CONT",    "CONT\r")
 
         ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
 
@@ -401,6 +414,15 @@ class X07LoaderApp(tk.Tk):
         self.txt.pack(fill="both", expand=True, pady=(4, 0))
 
         self._set_keyboard_controls_enabled(False)
+        self._update_handshake_ui()
+
+    def _update_handshake_ui(self):
+        delay_state = "disabled" if self.var_rtscts.get() else "normal"
+        for widget in (self.ent_char, self.ent_line, self.ent_post, self.ent_byte):
+            widget.configure(state=delay_state)
+
+    def _effective_delay(self, value: float) -> float:
+        return 0.0 if self.var_rtscts.get() else value
 
     # ---------------- Logging ----------------
     def _ts(self) -> str:
@@ -416,6 +438,7 @@ class X07LoaderApp(tk.Tk):
         self.log('SLAVE mode (BASIC TXT + ASM + REMOTE KEYBOARD): INIT#5,"COM:" then EXEC&HEE1F (user guide p.119).')
         self.log('CAS/K7 raw stream: use LOAD"COM:" or SAVE"COM:" on X-07, then send/receive raw bytes on PC.')
         self.log("Exit slave: EXEC&HEE33 (remote) or power cycle.")
+        self.log('Enable "RTS/CTS cable" when using a hardware-handshaked cable; timing delays are then bypassed.')
         self.log("")
 
     # ---------------- UI enabling/disabling ----------------
@@ -442,27 +465,30 @@ class X07LoaderApp(tk.Tk):
                 pass
 
     # ---------------- Ports ----------------
-
     def _config_path(self) -> Path:
         return Path(__file__).with_suffix(".ini")  # x07_loader.ini
 
-    def _load_last_port(self) -> str | None:
+    def _load_serial_settings(self) -> tuple[str | None, bool]:
         cfg_path = self._config_path()
         if not cfg_path.exists():
-            return None
+            return None, False
 
         cfg = configparser.ConfigParser()
         try:
             cfg.read(cfg_path, encoding="utf-8")
             port = cfg.get("serial", "port", fallback="").strip()
-            return port or None
+            rtscts = cfg.getboolean("serial", "rtscts", fallback=False)
+            return (port or None), rtscts
         except Exception:
-            return None
+            return None, False
 
-    def _save_last_port(self, port: str) -> None:
+    def _save_serial_settings(self) -> None:
         cfg_path = self._config_path()
         cfg = configparser.ConfigParser()
-        cfg["serial"] = {"port": port}
+        cfg["serial"] = {
+            "port": self.var_port.get(),
+            "rtscts": str(self.var_rtscts.get()),
+        }
 
         try:
             with cfg_path.open("w", encoding="utf-8") as f:
@@ -475,7 +501,9 @@ class X07LoaderApp(tk.Tk):
         self.cbo_port["values"] = ports
 
         cur = (self.var_port.get() or "").strip()
-        last = (self._load_last_port() or "").strip()
+        last, rtscts = self._load_serial_settings()
+        self.var_rtscts.set(rtscts)
+        last = (last or "").strip()
 
         if cur and cur in ports:
             chosen = cur
@@ -485,6 +513,7 @@ class X07LoaderApp(tk.Tk):
             chosen = ports[0] if ports else ""
 
         self.var_port.set(chosen)
+        self._update_handshake_ui()
 
         if initial:
             if ports:
@@ -563,9 +592,8 @@ class X07LoaderApp(tk.Tk):
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_TWO,
             timeout=0.2,
-            write_timeout=2.0,
             xonxoff=False,
-            rtscts=False,
+            rtscts=self.var_rtscts.get(),
             dsrdtr=False,
         )
 
@@ -574,6 +602,7 @@ class X07LoaderApp(tk.Tk):
         ser.bytesize = serial.SEVENBITS
         ser.parity = serial.PARITY_EVEN
         ser.stopbits = serial.STOPBITS_ONE
+        ser.rtscts = self.var_rtscts.get()
 
     def _parse_addr(self) -> int:
         s = self.var_addr.get().strip().lower()
@@ -582,8 +611,8 @@ class X07LoaderApp(tk.Tk):
         return int(s, 0)
 
     def _type_line(self, ser: serial.Serial, line: str):
-        char_delay = float(self.var_char.get())
-        line_delay = float(self.var_line.get())
+        char_delay = self._effective_delay(float(self.var_char.get()))
+        line_delay = self._effective_delay(float(self.var_line.get()))
         for ch in line.encode("ascii", errors="replace"):
             if self.cancel_event.is_set():
                 raise InterruptedError("Cancelled during BASIC typing.")
@@ -747,13 +776,13 @@ class X07LoaderApp(tk.Tk):
             with self._open_for_typing() as ser:
                 self._switch_to_xfer(ser)
                 self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
-                time.sleep(float(self.var_post.get()))
+                time.sleep(self._effective_delay(float(self.var_post.get())))
 
                 ser.write(f"{n}\r".encode("ascii"))
                 ser.flush()
                 time.sleep(0.01)
 
-                byte_delay = float(self.var_byte.get())
+                byte_delay = self._effective_delay(float(self.var_byte.get()))
                 for i, b in enumerate(data, start=1):
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during ASM transfer.")
@@ -802,13 +831,13 @@ class X07LoaderApp(tk.Tk):
 
                 self._switch_to_xfer(ser)
                 self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
-                time.sleep(float(self.var_post.get()))
+                time.sleep(self._effective_delay(float(self.var_post.get())))
 
                 ser.write(f"{n}\r".encode("ascii"))
                 ser.flush()
                 time.sleep(0.01)
 
-                byte_delay = float(self.var_byte.get())
+                byte_delay = self._effective_delay(float(self.var_byte.get()))
                 for i, b in enumerate(data, start=1):
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during ASM transfer.")
@@ -850,7 +879,6 @@ class X07LoaderApp(tk.Tk):
             messagebox.showwarning("Missing CAS/K7", "Select a .cas/.k7 file first.")
             return
         self._run_threaded(self._send_cas_raw_impl, 'Send CAS/K7 raw stream (LOAD"COM:")')
-
 
     def receive_cas_raw(self):
         p = filedialog.asksaveasfilename(
@@ -938,60 +966,19 @@ class X07LoaderApp(tk.Tk):
         self.log('[INFO] X-07 side: LOAD"COM:" then press RETURN.')
 
         total = len(payload)
-        if total <= 0:
-            raise ValueError("Empty CAS payload")
-
-        is_darwin = (sys.platform == "darwin")
-
-        # --- macOS pacing (no flush in the loop) ---
-        CHUNK = 64 if is_darwin else 512
-        CHUNK_SLEEP = 0.004 if is_darwin else 0.0      # 4ms between chunks on macOS
-        PAUSE_EVERY = 4096 if is_darwin else 0          # or 2048 for extra safety
-        PAUSE_SLEEP = 0.03 if is_darwin else 0.0        # 30ms
-
-        # --- end-of-program marker (manual: 13 trailing 0x00) ---
-        END_MARKER = b"\x00" * 13
-        need_append_end = not payload.endswith(END_MARKER)
-
-        # Give the ROM time to notice end-of-stream / timeout after end marker
-        POST_END_SILENCE = 2.5 if is_darwin else 0.8
 
         try:
             with self._open_for_typing() as ser:
-                # Make sure we start clean
-                try:
-                    ser.reset_input_buffer()
-                    ser.reset_output_buffer()
-                except Exception:
-                    pass  # not critical
-
                 sent = 0
+                chunk_size = 512
                 while sent < total:
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during CAS/K7 transfer.")
-
-                    end = min(total, sent + CHUNK)
+                    end = min(total, sent + chunk_size)
                     ser.write(payload[sent:end])
+                    ser.flush()
                     sent = end
-
-                    # pacing to avoid USB-serial "bursts" (especially on macOS)
-                    if CHUNK_SLEEP:
-                        time.sleep(CHUNK_SLEEP)
-                    if PAUSE_EVERY and (sent % PAUSE_EVERY == 0):
-                        time.sleep(PAUSE_SLEEP)
-
-                    if sent == total or (sent % 4096 == 0):
-                        self._set_progress((sent / total) * 100.0, f"CAS/K7 send {sent}/{total} bytes")
-
-                # Append end marker ONLY if missing
-                if need_append_end:
-                    ser.write(END_MARKER)
-                    if is_darwin:
-                        time.sleep(0.05)  # let the end marker "settle" in USB buffers
-
-                # do NOT rely on flush() tcdrain here; enforce silence instead
-                time.sleep(POST_END_SILENCE)
-
+                    self._set_progress((sent / total) * 100.0, f'CAS/K7 send {sent}/{total} bytes')
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
@@ -1068,23 +1055,32 @@ class X07LoaderApp(tk.Tk):
         k = event.keysym
 
         if k == "Left":
-            self._kbd_send_byte(KEY_LEFT);  return "break"
+            self._kbd_send_byte(KEY_LEFT)
+            return "break"
         if k == "Right":
-            self._kbd_send_byte(KEY_RIGHT); return "break"
+            self._kbd_send_byte(KEY_RIGHT)
+            return "break"
         if k == "Up":
-            self._kbd_send_byte(KEY_UP);    return "break"
+            self._kbd_send_byte(KEY_UP)
+            return "break"
         if k == "Down":
-            self._kbd_send_byte(KEY_DOWN);  return "break"
+            self._kbd_send_byte(KEY_DOWN)
+            return "break"
         if k == "Home":
-            self._kbd_send_byte(KEY_HOME);  return "break"
+            self._kbd_send_byte(KEY_HOME)
+            return "break"
         if k == "Insert":
-            self._kbd_send_byte(KEY_INS);   return "break"
+            self._kbd_send_byte(KEY_INS)
+            return "break"
         if k == "Delete":
-            self._kbd_send_byte(KEY_DEL);   return "break"
+            self._kbd_send_byte(KEY_DEL)
+            return "break"
         if k in ("Return", "KP_Enter"):
-            self._kbd_send_byte(KEY_RETURN); return "break"
+            self._kbd_send_byte(KEY_RETURN)
+            return "break"
         if k == "space":
-            self._kbd_send_byte(KEY_SPACE);  return "break"
+            self._kbd_send_byte(KEY_SPACE)
+            return "break"
 
         ch = event.char
         if ch:
