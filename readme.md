@@ -50,9 +50,27 @@ Avec une interface **FT232RL**, cela peut être configuré avec **FT_Prog** :
 ```
 Invert TXD : ON
 Invert RXD : ON
-Invert RTS : OFF
-Invert CTS : OFF
+Invert RTS : ON
+Invert CTS : ON
 ```
+
+⚠️ Important : résistances pull-down nécessaires sur certaines interfaces
+
+Sur certaines interfaces USB-UART (notamment **FT232RL**), il peut être nécessaire d’ajouter des résistances **pull-down (~10 kΩ)** sur les lignes :
+
+* **RX**
+* **CTS**
+
+Ces résistances permettent de fixer un **état logique stable** lorsque les lignes ne sont pas activement pilotées par le Canon X-07.
+
+Sans ces résistances, certaines configurations peuvent provoquer :
+
+* blocage de la communication série,
+* pertes de caractères (notamment les retours à la ligne),
+* transferts BASIC instables,
+* impossibilité de démarrer correctement les transferts.
+
+Une valeur de **10 kΩ** fonctionne généralement bien.  
 
 ---
 
@@ -361,11 +379,29 @@ With an **FT232RL** interface this can be configured using **FT_Prog**:
 ```
 Invert TXD : ON
 Invert RXD : ON
-Invert RTS : OFF
-Invert CTS : OFF
+Invert RTS : ON
+Invert CTS : ON
 ```
 
 Without this inversion the communication may fail or produce transmission errors.
+
+⚠️ Important: pull-down resistors may be required
+
+With some USB-UART adapters (especially **FT232RL** based ones), it may be necessary to add **pull-down resistors (~10 kΩ)** on the following lines:
+
+* **RX**
+* **CTS**
+
+These resistors ensure a **stable idle logic level** when the lines are not actively driven by the Canon X-07.
+
+Without these resistors some setups may experience:
+
+* serial communication blocking,
+* lost characters (especially carriage returns),
+* unstable BASIC transfers,
+* difficulty starting serial transfers.
+
+A value of **10 kΩ** usually works well.  
 
 ---
 

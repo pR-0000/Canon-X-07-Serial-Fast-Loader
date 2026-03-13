@@ -18,7 +18,6 @@ except ImportError:
     import serial.tools.list_ports
     from serial.serialutil import SerialException
 
-
 # ---------- Defaults ----------
 DEFAULT_CHAR_DELAY_S = 0.04
 DEFAULT_LINE_DELAY_S = 0.20
@@ -421,9 +420,6 @@ class X07LoaderApp(tk.Tk):
         for widget in (self.ent_char, self.ent_line, self.ent_post, self.ent_byte):
             widget.configure(state=delay_state)
 
-    def _effective_delay(self, value: float) -> float:
-        return 0.0 if self.var_rtscts.get() else value
-
     # ---------------- Logging ----------------
     def _ts(self) -> str:
         return time.strftime("[%H:%M:%S]")
@@ -611,8 +607,8 @@ class X07LoaderApp(tk.Tk):
         return int(s, 0)
 
     def _type_line(self, ser: serial.Serial, line: str):
-        char_delay = self._effective_delay(float(self.var_char.get()))
-        line_delay = self._effective_delay(float(self.var_line.get()))
+        char_delay = float(self.var_char.get())
+        line_delay = float(self.var_line.get())
         for ch in line.encode("ascii", errors="replace"):
             if self.cancel_event.is_set():
                 raise InterruptedError("Cancelled during BASIC typing.")
@@ -776,22 +772,20 @@ class X07LoaderApp(tk.Tk):
             with self._open_for_typing() as ser:
                 self._switch_to_xfer(ser)
                 self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
-                time.sleep(self._effective_delay(float(self.var_post.get())))
+                time.sleep(self.var_post.get())
 
                 ser.write(f"{n}\r".encode("ascii"))
                 ser.flush()
                 time.sleep(0.01)
 
-                byte_delay = self._effective_delay(float(self.var_byte.get()))
                 for i, b in enumerate(data, start=1):
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during ASM transfer.")
                     ser.write(f"{b}\r".encode("ascii"))
                     ser.flush()
-                    if byte_delay > 0:
-                        time.sleep(byte_delay)
-                    if i == 1 or i == n or (i % 32 == 0):
-                        self._set_progress((i / n) * 100.0, f"ASM {i}/{n} bytes")
+                    if self.var_byte.get() > 0:
+                        time.sleep(self.var_byte.get())
+                    self._set_progress((i / n) * 100.0, f"ASM {i}/{n} bytes")
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
@@ -831,23 +825,20 @@ class X07LoaderApp(tk.Tk):
 
                 self._switch_to_xfer(ser)
                 self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
-                time.sleep(self._effective_delay(float(self.var_post.get())))
+                time.sleep(self.var_post.get())
 
                 ser.write(f"{n}\r".encode("ascii"))
                 ser.flush()
                 time.sleep(0.01)
 
-                byte_delay = self._effective_delay(float(self.var_byte.get()))
                 for i, b in enumerate(data, start=1):
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during ASM transfer.")
                     ser.write(f"{b}\r".encode("ascii"))
                     ser.flush()
-                    if byte_delay > 0:
-                        time.sleep(byte_delay)
-                    if i == 1 or i == n or (i % 32 == 0):
-                        pct = 50.0 + (i / n) * 50.0
-                        self._set_progress(pct, f"ASM {i}/{n} bytes")
+                    if self.var_byte.get() > 0:
+                        time.sleep(self.var_byte.get())
+                    self._set_progress(50.0 + (i / n) * 50.0, f"ASM {i}/{n} bytes")
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
@@ -879,6 +870,42 @@ class X07LoaderApp(tk.Tk):
             messagebox.showwarning("Missing CAS/K7", "Select a .cas/.k7 file first.")
             return
         self._run_threaded(self._send_cas_raw_impl, 'Send CAS/K7 raw stream (LOAD"COM:")')
+
+    def _send_cas_raw_impl(self):
+        self._set_status("sending CAS/K7 raw bytes")
+        self._set_progress(0, "starting...")
+
+        data = self.cas_file.read_bytes()
+        base = CAS_FIXED_BASE
+        payload = data[base:]
+        if not payload:
+            raise RuntimeError("Empty payload (base beyond file length).")
+
+        name = guess_name_in_first_16_bytes(data, self.cas_file.stem)
+        self.log(f'[INFO] CAS/K7 file: {self.cas_file.name} | name guess: {name}')
+        self.log(f'[INFO] Sending raw bytes from base=0x{base:04X} (len={len(payload)}).')
+        self.log('[INFO] X-07 side: LOAD"COM:" then press RETURN.')
+
+        total = len(payload)
+
+        try:
+            with self._open_for_typing() as ser:
+                sent = 0
+                chunk_size = 512
+                while sent < total:
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("Cancelled during CAS/K7 transfer.")
+                    end = min(total, sent + chunk_size)
+                    ser.write(payload[sent:end])
+                    ser.flush()
+                    sent = end
+                    self._set_progress((sent / total) * 100.0, f'CAS/K7 send {sent}/{total} bytes')
+        except (SerialException, OSError) as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
+
+        self._set_progress(100.0, "CAS/K7 send done")
+        self.log("[INFO] CAS/K7 raw transfer finished.")
 
     def receive_cas_raw(self):
         p = filedialog.asksaveasfilename(
@@ -918,8 +945,7 @@ class X07LoaderApp(tk.Tk):
                         got_any = True
                         last_rx = time.time()
 
-                        if len(buf) == len(chunk) or (len(buf) % 4096 == 0):
-                            self._set_progress(0.0, f"CAS/K7 recv {len(buf)} bytes")
+                        self._set_progress(0.0, f"CAS/K7 recv {len(buf)} bytes")
                     else:
                         if got_any and (time.time() - last_rx) >= SAVE_IDLE_TIMEOUT_S:
                             break
@@ -949,42 +975,6 @@ class X07LoaderApp(tk.Tk):
 
         self._set_progress(100.0, f"CAS/K7 recv done ({len(buf)} bytes)")
         self.log(f"[OK] Received {len(buf)} bytes. Saved: {out_path.name}")
-
-    def _send_cas_raw_impl(self):
-        self._set_status("sending CAS/K7 raw bytes")
-        self._set_progress(0, "starting...")
-
-        data = self.cas_file.read_bytes()
-        base = CAS_FIXED_BASE
-        payload = data[base:]
-        if not payload:
-            raise RuntimeError("Empty payload (base beyond file length).")
-
-        name = guess_name_in_first_16_bytes(data, self.cas_file.stem)
-        self.log(f'[INFO] CAS/K7 file: {self.cas_file.name} | name guess: {name}')
-        self.log(f'[INFO] Sending raw bytes from base=0x{base:04X} (len={len(payload)}).')
-        self.log('[INFO] X-07 side: LOAD"COM:" then press RETURN.')
-
-        total = len(payload)
-
-        try:
-            with self._open_for_typing() as ser:
-                sent = 0
-                chunk_size = 512
-                while sent < total:
-                    if self.cancel_event.is_set():
-                        raise InterruptedError("Cancelled during CAS/K7 transfer.")
-                    end = min(total, sent + chunk_size)
-                    ser.write(payload[sent:end])
-                    ser.flush()
-                    sent = end
-                    self._set_progress((sent / total) * 100.0, f'CAS/K7 send {sent}/{total} bytes')
-        except (SerialException, OSError) as e:
-            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
-            return
-
-        self._set_progress(100.0, "CAS/K7 send done")
-        self.log("[INFO] CAS/K7 raw transfer finished.")
 
     # ---------------- Remote keyboard ----------------
     def toggle_remote_keyboard(self):
