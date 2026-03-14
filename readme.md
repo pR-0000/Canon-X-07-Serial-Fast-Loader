@@ -43,7 +43,7 @@ Optionnel :
 Les adaptateurs USB-UART modernes (FT232, CP2102, CH340…) supportent généralement ces lignes.
 
 ⚠️ Particularité du Canon X-07 :
-les lignes **RX et TX utilisent une logique inversée**, alors que **RTS et CTS ne doivent pas être inversés**.
+les lignes **RX, TX, RTS et CTS utilisent une logique inversée**.
 
 Avec une interface **FT232RL**, cela peut être configuré avec **FT_Prog** :
 
@@ -372,7 +372,7 @@ Optional:
 Modern USB-UART adapters (FT232, CP2102, CH340, etc.) usually support these lines.
 
 ⚠️ Canon X-07 specific note:
-the **RX and TX signals use inverted logic**, while **RTS and CTS must NOT be inverted**.
+the **RX, TX, RTS and CTS signals use inverted logic**.
 
 With an **FT232RL** interface this can be configured using **FT_Prog**:
 
