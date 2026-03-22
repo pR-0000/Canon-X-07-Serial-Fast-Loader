@@ -18,6 +18,12 @@ except ImportError:
     import serial.tools.list_ports
     from serial.serialutil import SerialException
 
+try:
+    import termios
+    HAS_TERMIOS = True
+except ImportError:
+    HAS_TERMIOS = False
+
 # ---------- Defaults ----------
 DEFAULT_CHAR_DELAY_S = 0.04
 DEFAULT_LINE_DELAY_S = 0.20
@@ -43,6 +49,275 @@ KEY_RIGHT    = 0x1C
 KEY_LEFT     = 0x1D
 KEY_UP       = 0x1E
 KEY_DOWN     = 0x1F
+
+
+# ---------- Canon X-07 text encoding ----------
+# Imported from basX07.c for compatibility with Canon X-07 national/special characters.
+# The mappings are intentionally kept aligned with the original C tables.
+X07_UNICODE_MAP = {
+    "¥": 0x5C,
+    "¿": 0x7F,
+    "♠": 0x80,
+    "♥": 0x81,
+    "♣": 0x82,
+    "♦": 0x83,
+    "○": 0x84,
+    "●": 0x85,
+    "Ä": 0x86,
+    "Å": 0x87,
+    "ä": 0x88,
+    "à": 0x89,
+    "â": 0x8A,
+    "á": 0x8B,
+    "å": 0x8C,
+    "a̱": 0x8D,
+    "Ï": 0x8E,
+    "ï": 0x8F,
+    "ì": 0x90,
+    "î": 0x91,
+    "í": 0x92,
+    "Ü": 0x93,
+    "ü": 0x94,
+    "ù": 0x95,
+    "û": 0x96,
+    "ú": 0x97,
+    "É": 0x98,
+    "ë": 0x99,
+    "è": 0x9A,
+    "ê": 0x9B,
+    "é": 0x9C,
+    "Ö": 0x9D,
+    "ö": 0x9E,
+    "ò": 0x9F,
+    "√": 0xA0,
+    "・": 0xA1,
+    "「": 0xA2,
+    "」": 0xA3,
+    "、": 0xA4,
+    "。": 0xA5,
+    "ヲ": 0xA6,
+    "ァ": 0xA7,
+    "ィ": 0xA8,
+    "ゥ": 0xA9,
+    "ェ": 0xAA,
+    "ォ": 0xAB,
+    "ャ": 0xAC,
+    "ュ": 0xAD,
+    "ョ": 0xAE,
+    "ッ": 0xAF,
+    "ー": 0xB0,
+    "ア": 0xB1,
+    "イ": 0xB2,
+    "ウ": 0xB3,
+    "エ": 0xB4,
+    "オ": 0xB5,
+    "カ": 0xB6,
+    "キ": 0xB7,
+    "ク": 0xB8,
+    "ケ": 0xB9,
+    "コ": 0xBA,
+    "サ": 0xBB,
+    "シ": 0xBC,
+    "ヌ": 0xBD,
+    "ャ": 0xBE,
+    "ソ": 0xBF,
+    "タ": 0xC0,
+    "チ": 0xC1,
+    "ツ": 0xC2,
+    "テ": 0xC3,
+    "ト": 0xC4,
+    "ナ": 0xC5,
+    "ニ": 0xC6,
+    "ヌ": 0xC7,
+    "ネ": 0xC8,
+    "ノ": 0xC9,
+    "ハ": 0xCA,
+    "ヒ": 0xCB,
+    "フ": 0xCC,
+    "ヘ": 0xCD,
+    "ホ": 0xCE,
+    "マ": 0xCF,
+    "ミ": 0xD0,
+    "ム": 0xD1,
+    "メ": 0xD2,
+    "モ": 0xD3,
+    "ヤ": 0xD4,
+    "ユ": 0xD5,
+    "ヨ": 0xD6,
+    "ラ": 0xD7,
+    "リ": 0xD8,
+    "ル": 0xD9,
+    "レ": 0xDA,
+    "ロ": 0xDB,
+    "ワ": 0xDC,
+    "ン": 0xDD,
+    "゛": 0xDE,
+    "゜": 0xDF,
+    "ô": 0xE0,
+    "ó": 0xE1,
+    "o̱": 0xE2,
+    "ÿ": 0xE3,
+    "Ç": 0xE4,
+    "ç": 0xE5,
+    "Ñ": 0xE6,
+    "ñ": 0xE7,
+    "Γ": 0xE8,
+    "Σ": 0xE9,
+    "Π": 0xEA,
+    "Ω": 0xEB,
+    "α": 0xEC,
+    "β": 0xED,
+    "γ": 0xEE,
+    "δ": 0xEF,
+    "ε": 0xF0,
+    "ζ": 0xF1,
+    "θ": 0xF2,
+    "κ": 0xF3,
+    "λ": 0xF4,
+    "μ": 0xF5,
+    "ρ": 0xF6,
+    "π": 0xF7,
+    "τ": 0xF8,
+    "ϕ": 0xF9,
+    "χ": 0xFA,
+    "ω": 0xFB,
+    "ν": 0xFC,
+    "£": 0xFD,
+    "¢": 0xFE,
+    "÷": 0xFF,
+}
+
+X07_ESCAPE_MAP = {
+    "\\": 0x5C,
+    "YN": 0x5C,
+    "?": 0x7F,
+    "SP": 0x80,
+    "HT": 0x81,
+    "DI": 0x82,
+    "CL": 0x83,
+    "@": 0x84,
+    "LD": 0x85,
+    ":A": 0x86,
+    ".A": 0x87,
+    "AN": 0x87,
+    ":a": 0x88,
+    "`a": 0x89,
+    "^a": 0x8A,
+    "'a": 0x8B,
+    ".a": 0x8C,
+    "_a": 0x8D,
+    ":I": 0x8E,
+    ":i": 0x8F,
+    "`i": 0x90,
+    "^i": 0x91,
+    "'i": 0x92,
+    ":U": 0x93,
+    ":u": 0x94,
+    "`u": 0x95,
+    "^u": 0x96,
+    "'u": 0x97,
+    "'E": 0x98,
+    ":e": 0x99,
+    "`e": 0x9A,
+    "^e": 0x9B,
+    "'e": 0x9C,
+    ":O": 0x9D,
+    ":o": 0x9E,
+    "`o": 0x9F,
+    "RT": 0xA0,
+    "^o": 0xE0,
+    "'o": 0xE1,
+    "_o": 0xE2,
+    ":y": 0xE3,
+    ",C": 0xE4,
+    ",c": 0xE5,
+    "~N": 0xE6,
+    "~n": 0xE7,
+    "GA": 0xE8,
+    "SI": 0xE9,
+    "SM": 0xE9,
+    "PI": 0xEA,
+    "OM": 0xEB,
+    "al": 0xEC,
+    "bt": 0xED,
+    "ga": 0xEE,
+    "dl": 0xEF,
+    "ep": 0xF0,
+    "si": 0xF1,
+    "th": 0xF2,
+    "ka": 0xF3,
+    "la": 0xF4,
+    "mu": 0xF5,
+    "rh": 0xF6,
+    "pi": 0xF7,
+    "ta": 0xF8,
+    "ps": 0xF9,
+    "ch": 0xFA,
+    "om": 0xFB,
+    "nu": 0xFC,
+    "PN": 0xFD,
+    "CN": 0xFE,
+    ":-": 0xFF,
+}
+
+_X07_UNICODE_KEYS = sorted(X07_UNICODE_MAP, key=len, reverse=True)
+_X07_ESCAPE_KEYS = sorted(X07_ESCAPE_MAP, key=len, reverse=True)
+
+
+def _match_escape_token(text: str) -> tuple[int | None, int]:
+    for key in _X07_ESCAPE_KEYS:
+        if text.startswith(key):
+            return X07_ESCAPE_MAP[key], len(key)
+    lower = text.lower()
+    for key in _X07_ESCAPE_KEYS:
+        if lower.startswith(key.lower()):
+            return X07_ESCAPE_MAP[key], len(key)
+    if len(text) >= 2 and all(c in '0123456789abcdefABCDEF' for c in text[:2]):
+        return int(text[:2], 16), 2
+    return None, 0
+
+
+def x07_encode_text(text: str) -> bytes:
+    """Encode a Python string to Canon X-07 text bytes.
+
+    Supports direct Unicode characters (accented latin, Greek, katakana, symbols)
+    and the original basX07-style backslash escapes such as \\'e, \\PI or \\A0.
+    Unknown characters fall back to '?' so transfers remain robust.
+    """
+    out = bytearray()
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\":
+            token, consumed = _match_escape_token(text[i + 1:])
+            if token is not None:
+                out.append(token)
+                i += 1 + consumed
+                continue
+            out.append(0x5C)
+            i += 1
+            continue
+
+        matched = False
+        for key in _X07_UNICODE_KEYS:
+            if text.startswith(key, i):
+                out.append(X07_UNICODE_MAP[key])
+                i += len(key)
+                matched = True
+                break
+        if matched:
+            continue
+
+        ch = text[i]
+        code = ord(ch)
+        if ch in "\r\n":
+            out.append(code)
+        elif 0x20 <= code <= 0x7E:
+            out.append(code)
+        else:
+            out.append(ord("?"))
+        i += 1
+    return bytes(out)
 
 
 def list_serial_ports():
@@ -367,7 +642,7 @@ class X07LoaderApp(tk.Tk):
                 row_btns,
                 text=label,
                 width=w,
-                command=lambda: self._kbd_send_bytes(text.encode("ascii", errors="replace")),
+                command=lambda: self._kbd_send_bytes(x07_encode_text(text)),
             )
             b.pack(side="left", padx=(2, 0))
             self._kbd_controls.append(b)
@@ -434,7 +709,7 @@ class X07LoaderApp(tk.Tk):
         self.log('SLAVE mode (BASIC TXT + ASM + REMOTE KEYBOARD): INIT#5,"COM:" then EXEC&HEE1F (user guide p.119).')
         self.log('CAS/K7 raw stream: use LOAD"COM:" or SAVE"COM:" on X-07, then send/receive raw bytes on PC.')
         self.log("Exit slave: EXEC&HEE33 (remote) or power cycle.")
-        self.log('Enable "RTS/CTS cable" when using a hardware-handshaked cable; timing delays are then bypassed.')
+        self.log('Enable "RTS/CTS cable" when using a hardware-handshaked cable.')
         self.log("")
 
     # ---------------- UI enabling/disabling ----------------
@@ -891,15 +1166,46 @@ class X07LoaderApp(tk.Tk):
         try:
             with self._open_for_typing() as ser:
                 sent = 0
-                chunk_size = 512
+                chunk_size = 64
+
                 while sent < total:
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during CAS/K7 transfer.")
+
                     end = min(total, sent + chunk_size)
                     ser.write(payload[sent:end])
                     ser.flush()
+
+                    if HAS_TERMIOS:
+                        try:
+                            termios.tcdrain(ser.fileno())
+                        except Exception:
+                            pass
+
                     sent = end
                     self._set_progress((sent / total) * 100.0, f'CAS/K7 send {sent}/{total} bytes')
+
+                ser.flush()
+
+                if HAS_TERMIOS:
+                    try:
+                        termios.tcdrain(ser.fileno())
+                    except Exception:
+                        pass
+
+                deadline = time.time() + 2.0
+                while getattr(ser, "out_waiting", 0) > 0 and time.time() < deadline:
+                    time.sleep(0.01)
+
+                time.sleep(0.3)
+
+                if self.var_rtscts.get():
+                    try:
+                        ser.rts = False
+                        time.sleep(0.2)
+                    except Exception:
+                        pass
+
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
@@ -1074,9 +1380,9 @@ class X07LoaderApp(tk.Tk):
 
         ch = event.char
         if ch:
-            b = ord(ch)
-            if 0x20 <= b <= 0x7E:
-                self._kbd_send_byte(b)
+            data = x07_encode_text(ch)
+            if data:
+                self._kbd_send_bytes(data)
         return "break"
 
 
