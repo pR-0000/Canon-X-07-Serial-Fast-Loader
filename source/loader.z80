@@ -1,1 +1,171 @@
+    include "canon_x07.inc"
+    .org $1800
 
+start:
+    ei
+
+    ; Init COM via ROM
+    ld de,DEV_COM_TABLE
+    xor a
+    ld b,"B"	; 8N2
+    ld ix,8000	; 8000 baud
+    ld iy,SYS_KBNTAB
+    call ROM_DEV_OPEN
+    ld de,SYS_KBNTAB
+    call ROM_DEV_ASSIGN
+
+; ----------------------------------------
+; Attente synchro 'L'
+; BREAK => retour BASIC
+; ----------------------------------------
+wait_sync:
+    call get_char_filtered
+    ret c
+    cp 'L'
+    jr nz,wait_sync
+
+; ----------------------------------------
+; Lecture adresse AAAA -> HL
+; ----------------------------------------
+    call read_hex16
+    ret c
+    ld (load_addr),hl
+
+; ----------------------------------------
+; Lecture taille SSSS -> BC
+; ----------------------------------------
+    call read_hex16
+    ret c
+    ld b,h
+    ld c,l
+
+    ; taille nulle => retour BASIC
+    ld a,b
+    or c
+    ret z
+
+    ld hl,(load_addr)
+
+; ----------------------------------------
+; Réception des données
+; ----------------------------------------
+recv_loop:
+    call read_hex8
+    ret c
+
+    ld (hl),a
+    inc hl
+    dec bc
+
+    ld a,b
+    or c
+    jr nz,recv_loop
+
+	ld hl,(load_addr)
+    jp (hl)
+
+load_addr:
+    .dw 0
+
+; ----------------------------------------
+; Lit un caractère via ROM_DEV_GETC
+; Ignore CR / LF / espace
+; Retour :
+;   A = caractère
+;   Carry = 1 si BREAK
+; ----------------------------------------
+get_char_filtered:
+.loop:
+    ld a,(SYS_BREAKFLAG)
+    and $83
+    scf
+    ret nz
+
+    call ROM_DEV_GETC
+
+    cp 13                   ; CR
+    jr z,.loop
+    cp 10                   ; LF
+    jr z,.loop
+    cp ' '
+    jr z,.loop
+
+    and a                   ; Carry=0
+    ret
+
+; ----------------------------------------
+; Lit un nibble hex ASCII
+; Retour :
+;   A = 0..15
+;   Carry = 1 si BREAK
+; ----------------------------------------
+read_hex_nibble:
+.loop:
+    call get_char_filtered
+    ret c
+
+    cp '0'
+    jr c,.loop
+    cp '9'+1
+    jr c,.digit
+
+    cp 'A'
+    jr c,.check_lower
+    cp 'F'+1
+    jr c,.upper
+
+.check_lower:
+    cp 'a'
+    jr c,.loop
+    cp 'f'+1
+    jr nc,.loop
+    sub 'a' - 10
+    and a
+    ret
+
+.upper:
+    sub 'A' - 10
+    and a
+    ret
+
+.digit:
+    sub '0'
+    and a
+    ret
+
+; ----------------------------------------
+; Lit 2 caractères hex -> A
+; Carry = 1 si BREAK
+; ----------------------------------------
+read_hex8:
+    call read_hex_nibble
+    ret c
+    add a,a
+    add a,a
+    add a,a
+    add a,a
+    push af
+
+    call read_hex_nibble
+    ret c
+    ld e,a
+
+    pop af
+    or e
+    and a
+    ret
+
+; ----------------------------------------
+; Lit 4 caractères hex -> HL
+; Carry = 1 si BREAK
+; ----------------------------------------
+read_hex16:
+    call read_hex8
+    ret c
+    ld h,a
+
+    call read_hex8
+    ret c
+    ld l,a
+    and a
+    ret
