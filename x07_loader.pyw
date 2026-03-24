@@ -27,9 +27,12 @@ except ImportError:
 # ---------- Defaults ----------
 DEFAULT_CHAR_DELAY_S = 0.04
 DEFAULT_LINE_DELAY_S = 0.20
-DEFAULT_POST_INIT_DELAY_S = 2.0
-DEFAULT_BYTE_DELAY_S = 0.02
 DEFAULT_LOAD_ADDR = 0x2000
+DEFAULT_LOADER_ADDR = 0x1800
+POST_LOADER_EXEC_DELAY_S = 3.0
+ASM_PRIMER = b"X" * 1024
+LOADER_CAS_NAME = "loader.cas"
+LOADER_BYTE_COUNT = 162
 
 CAS_FIXED_BASE = 0x0010  # fixed (validated for SEND)
 SAVE_IDLE_TIMEOUT_S = 1.25  # end capture if no bytes for this duration (after any data received)
@@ -452,14 +455,17 @@ class X07LoaderApp(tk.Tk):
         self.var_port = tk.StringVar(value="")
         self.var_port.trace_add("write", lambda *_: self._save_serial_settings())
         self.var_typing_baud = tk.IntVar(value=4800)   # 8N2
-        self.var_xfer_baud = tk.IntVar(value=8000)     # 7E1
+        self.var_xfer_baud = tk.IntVar(value=8000)     # 8N2 loader/runtime
 
         self.var_char = tk.DoubleVar(value=DEFAULT_CHAR_DELAY_S)
         self.var_line = tk.DoubleVar(value=DEFAULT_LINE_DELAY_S)
-        self.var_post = tk.DoubleVar(value=DEFAULT_POST_INIT_DELAY_S)
-        self.var_byte = tk.DoubleVar(value=DEFAULT_BYTE_DELAY_S)
         self.var_rtscts = tk.BooleanVar(value=False)
+
         self.var_rtscts.trace_add("write", lambda *_: self._save_serial_settings())
+        self.var_typing_baud.trace_add("write", lambda *_: self._save_serial_settings())
+        self.var_xfer_baud.trace_add("write", lambda *_: self._save_serial_settings())
+        self.var_char.trace_add("write", lambda *_: self._save_serial_settings())
+        self.var_line.trace_add("write", lambda *_: self._save_serial_settings())
 
         r = ttk.Frame(serial_box)
         r.pack(fill="x")
@@ -475,7 +481,7 @@ class X07LoaderApp(tk.Tk):
         ttk.Label(r, text="Typing baud (8N2):").pack(side="left")
         ttk.Entry(r, textvariable=self.var_typing_baud, width=7).pack(side="left", padx=(4, 10))
 
-        ttk.Label(r, text="Xfer baud (7E1):").pack(side="left")
+        ttk.Label(r, text="Loader baud (8N2):").pack(side="left")
         ttk.Entry(r, textvariable=self.var_xfer_baud, width=7).pack(side="left", padx=(4, 10))
 
         self.chk_rtscts = ttk.Checkbutton(
@@ -496,15 +502,6 @@ class X07LoaderApp(tk.Tk):
         self.ent_line = ttk.Entry(r, textvariable=self.var_line, width=6)
         self.ent_line.pack(side="left", padx=(3, 8))
 
-        self.lbl_post = ttk.Label(r, text="PostINIT(s):")
-        self.lbl_post.pack(side="left")
-        self.ent_post = ttk.Entry(r, textvariable=self.var_post, width=6)
-        self.ent_post.pack(side="left", padx=(3, 8))
-
-        self.lbl_byte = ttk.Label(r, text="Byte(s):")
-        self.lbl_byte.pack(side="left")
-        self.ent_byte = ttk.Entry(r, textvariable=self.var_byte, width=6)
-        self.ent_byte.pack(side="left", padx=(3, 0))
 
         # cancel/disable slave row
         r2 = ttk.Frame(serial_box)
@@ -518,7 +515,7 @@ class X07LoaderApp(tk.Tk):
 
         ttk.Label(
             r2,
-            text='Note: BASIC TXT, ASM and REMOTE KEYBOARD use SLAVE mode (INIT#5,"COM:" then EXEC&HEE1F).',
+            text='Note: BASIC TXT and REMOTE KEYBOARD use SLAVE mode (INIT#5,"COM:" then EXEC&HEE1F). ASM uses loader.cas + ASCII fast loader.',
         ).pack(side="left", padx=(10, 0))
 
         # ---- BASIC ----
@@ -556,8 +553,6 @@ class X07LoaderApp(tk.Tk):
         btn_recv_cas.pack(side="left", padx=(6, 0))
         self._transfer_controls.append(btn_recv_cas)
 
-        ttk.Label(cas, text="Send base: fixed 0x0010 (validated). Receive: saves as CAS with D3 header + stream.").pack(anchor="w", pady=(4, 0))
-
         # TXT/BAS (RIGHT)
         txt = ttk.LabelFrame(right, text="Text listing (.txt/.bas) via SLAVE mode", padding=6)
         txt.pack(fill="both", expand=True)
@@ -576,11 +571,13 @@ class X07LoaderApp(tk.Tk):
         self._transfer_controls.append(btn_send_basic)
 
         # ---- ASM ----
-        asm = ttk.LabelFrame(main, text="ASM via SLAVE mode", padding=6)
+        asm = ttk.LabelFrame(main, text="ASM via loader.cas + ASCII fast loader", padding=6)
         asm.pack(fill="x", pady=(0, 6))
 
+        self.var_loader_addr = tk.StringVar(value=hex(DEFAULT_LOADER_ADDR))
         self.var_addr = tk.StringVar(value=hex(DEFAULT_LOAD_ADDR))
-        self.var_append_run = tk.BooleanVar(value=True)
+        self.var_loader_addr.trace_add("write", lambda *_: self._save_serial_settings())
+        self.var_addr.trace_add("write", lambda *_: self._save_serial_settings())
 
         self.lbl_bin = ttk.Label(asm, text="Selected ASM binary: (none)")
         self.lbl_bin.pack(anchor="w")
@@ -591,20 +588,21 @@ class X07LoaderApp(tk.Tk):
         btn_pick_bin.pack(side="left")
         self._transfer_controls.append(btn_pick_bin)
 
-        ttk.Label(ra, text="Load addr:").pack(side="left", padx=(10, 4))
+        ttk.Label(ra, text="Loader addr:").pack(side="left", padx=(10, 4))
+        ttk.Entry(ra, textvariable=self.var_loader_addr, width=10).pack(side="left")
+
+        ttk.Label(ra, text="ASM addr:").pack(side="left", padx=(10, 4))
         ttk.Entry(ra, textvariable=self.var_addr, width=10).pack(side="left")
 
-        btn_send_loader = ttk.Button(ra, text="Send BASIC fast loader", command=self.send_fast_loader)
+        btn_send_loader = ttk.Button(ra, text='Send ASM loader (LOAD"COM:")', command=self.send_fast_loader)
         btn_send_loader.pack(side="left", padx=(10, 0))
         self._transfer_controls.append(btn_send_loader)
-
-        ttk.Checkbutton(ra, text="Append RUN", variable=self.var_append_run).pack(side="left", padx=(8, 0))
 
         btn_send_asm = ttk.Button(ra, text="Send ASM (loader running)", command=self.send_bin_only)
         btn_send_asm.pack(side="left", padx=(10, 0))
         self._transfer_controls.append(btn_send_asm)
 
-        btn_one_click = ttk.Button(ra, text="One click: loader + ASM", command=self.send_loader_and_bin)
+        btn_one_click = ttk.Button(ra, text="One click: send loader + ASM (SLAVE mode)", command=self.send_loader_and_bin)
         btn_one_click.pack(side="left", padx=(10, 0))
         self._transfer_controls.append(btn_one_click)
 
@@ -691,9 +689,7 @@ class X07LoaderApp(tk.Tk):
         self._update_handshake_ui()
 
     def _update_handshake_ui(self):
-        delay_state = "disabled" if self.var_rtscts.get() else "normal"
-        for widget in (self.ent_char, self.ent_line, self.ent_post, self.ent_byte):
-            widget.configure(state=delay_state)
+        return
 
     # ---------------- Logging ----------------
     def _ts(self) -> str:
@@ -706,10 +702,10 @@ class X07LoaderApp(tk.Tk):
 
     def _log_startup_banner(self):
         self.log("Canon X-07 Serial Fast Loader - ready.")
-        self.log('SLAVE mode (BASIC TXT + ASM + REMOTE KEYBOARD): INIT#5,"COM:" then EXEC&HEE1F (user guide p.119).')
+        self.log('SLAVE mode (BASIC TXT + REMOTE KEYBOARD): INIT#5,"COM:" then EXEC&HEE1F (user guide p.119).')
         self.log('CAS/K7 raw stream: use LOAD"COM:" or SAVE"COM:" on X-07, then send/receive raw bytes on PC.')
         self.log("Exit slave: EXEC&HEE33 (remote) or power cycle.")
-        self.log('Enable "RTS/CTS cable" when using a hardware-handshaked cable.')
+        self.log('Enable "RTS/CTS cable" when using a hardware-handshaked cable. Delay fields stay available and are still used for typing / loader send.')
         self.log("")
 
     # ---------------- UI enabling/disabling ----------------
@@ -739,19 +735,35 @@ class X07LoaderApp(tk.Tk):
     def _config_path(self) -> Path:
         return Path(__file__).with_suffix(".ini")  # x07_loader.ini
 
-    def _load_serial_settings(self) -> tuple[str | None, bool]:
+    def _load_serial_settings(self) -> dict:
         cfg_path = self._config_path()
+        settings = {
+            "port": None,
+            "rtscts": False,
+            "typing_baud": 4800,
+            "xfer_baud": 8000,
+            "char_delay": DEFAULT_CHAR_DELAY_S,
+            "line_delay": DEFAULT_LINE_DELAY_S,
+            "loader_addr": hex(DEFAULT_LOADER_ADDR),
+            "asm_addr": hex(DEFAULT_LOAD_ADDR),
+        }
         if not cfg_path.exists():
-            return None, False
+            return settings
 
         cfg = configparser.ConfigParser()
         try:
             cfg.read(cfg_path, encoding="utf-8")
-            port = cfg.get("serial", "port", fallback="").strip()
-            rtscts = cfg.getboolean("serial", "rtscts", fallback=False)
-            return (port or None), rtscts
+            settings["port"] = cfg.get("serial", "port", fallback="").strip() or None
+            settings["rtscts"] = cfg.getboolean("serial", "rtscts", fallback=False)
+            settings["typing_baud"] = cfg.getint("serial", "typing_baud", fallback=4800)
+            settings["xfer_baud"] = cfg.getint("serial", "xfer_baud", fallback=8000)
+            settings["char_delay"] = cfg.getfloat("serial", "char_delay", fallback=DEFAULT_CHAR_DELAY_S)
+            settings["line_delay"] = cfg.getfloat("serial", "line_delay", fallback=DEFAULT_LINE_DELAY_S)
+            settings["loader_addr"] = cfg.get("serial", "loader_addr", fallback=hex(DEFAULT_LOADER_ADDR))
+            settings["asm_addr"] = cfg.get("serial", "asm_addr", fallback=hex(DEFAULT_LOAD_ADDR))
         except Exception:
-            return None, False
+            pass
+        return settings
 
     def _save_serial_settings(self) -> None:
         cfg_path = self._config_path()
@@ -759,6 +771,12 @@ class X07LoaderApp(tk.Tk):
         cfg["serial"] = {
             "port": self.var_port.get(),
             "rtscts": str(self.var_rtscts.get()),
+            "typing_baud": str(self.var_typing_baud.get()),
+            "xfer_baud": str(self.var_xfer_baud.get()),
+            "char_delay": str(self.var_char.get()),
+            "line_delay": str(self.var_line.get()),
+            "loader_addr": self.var_loader_addr.get(),
+            "asm_addr": self.var_addr.get(),
         }
 
         try:
@@ -772,9 +790,15 @@ class X07LoaderApp(tk.Tk):
         self.cbo_port["values"] = ports
 
         cur = (self.var_port.get() or "").strip()
-        last, rtscts = self._load_serial_settings()
-        self.var_rtscts.set(rtscts)
-        last = (last or "").strip()
+        settings = self._load_serial_settings()
+        self.var_rtscts.set(bool(settings.get("rtscts", False)))
+        self.var_typing_baud.set(int(settings.get("typing_baud", 4800)))
+        self.var_xfer_baud.set(int(settings.get("xfer_baud", 8000)))
+        self.var_char.set(float(settings.get("char_delay", DEFAULT_CHAR_DELAY_S)))
+        self.var_line.set(float(settings.get("line_delay", DEFAULT_LINE_DELAY_S)))
+        self.var_loader_addr.set(str(settings.get("loader_addr", hex(DEFAULT_LOADER_ADDR))))
+        self.var_addr.set(str(settings.get("asm_addr", hex(DEFAULT_LOAD_ADDR))))
+        last = (settings.get("port") or "").strip()
 
         if cur and cur in ports:
             chosen = cur
@@ -868,18 +892,208 @@ class X07LoaderApp(tk.Tk):
             dsrdtr=False,
         )
 
-    def _switch_to_xfer(self, ser: serial.Serial):
-        ser.baudrate = int(self.var_xfer_baud.get())
-        ser.bytesize = serial.SEVENBITS
-        ser.parity = serial.PARITY_EVEN
-        ser.stopbits = serial.STOPBITS_ONE
-        ser.rtscts = self.var_rtscts.get()
+    def _open_for_raw(self) -> serial.Serial:
+        return serial.Serial(
+            self._require_port(),
+            int(self.var_xfer_baud.get()),
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_TWO,
+            timeout=0.2,
+            xonxoff=False,
+            rtscts=self.var_rtscts.get(),
+            dsrdtr=False,
+        )
+
+
+    def _prime_loader_xfer(self, ser: serial.Serial):
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+        try:
+            ser.reset_output_buffer()
+        except Exception:
+            pass
 
     def _parse_addr(self) -> int:
         s = self.var_addr.get().strip().lower()
         if s.endswith("h"):
             return int(s[:-1], 16)
         return int(s, 0)
+
+    def _parse_loader_addr(self) -> int:
+        s = self.var_loader_addr.get().strip().lower()
+        if s.endswith("h"):
+            return int(s[:-1], 16)
+        return int(s, 0)
+
+    def _loader_cas_path(self) -> Path:
+        return Path(__file__).with_name(LOADER_CAS_NAME)
+
+
+
+    def _build_loader_cas_payload(self) -> bytes:
+        template_path = self._loader_cas_path()
+        if not template_path.exists():
+            raise RuntimeError(f"Missing loader template: {template_path}")
+
+        cas_bytes = template_path.read_bytes()
+        if len(cas_bytes) <= CAS_FIXED_BASE:
+            raise RuntimeError("Loader template too short.")
+
+        payload = bytearray(cas_bytes[CAS_FIXED_BASE:])
+        original_payload_len = len(payload)
+
+        load_addr = self._parse_loader_addr() & 0xFFFF
+        end_addr = (load_addr + LOADER_BYTE_COUNT - 1) & 0xFFFF
+
+        # Patch inside the raw payload
+        ascii_addr_offsets = [
+            (9,  b"&H1800"),  # CLEAR
+            (23, b"&H1800"),  # FOR start
+            (30, b"&H18A1"),  # FOR end
+            (66, b"&H1800"),  # EXEC
+        ]
+        ascii_addr_values = [
+            f"&H{load_addr:04X}".encode("ascii"),
+            f"&H{load_addr:04X}".encode("ascii"),
+            f"&H{end_addr:04X}".encode("ascii"),
+            f"&H{load_addr:04X}".encode("ascii"),
+        ]
+        for (offset, expected), repl in zip(ascii_addr_offsets, ascii_addr_values):
+            if payload[offset:offset + len(expected)] != expected:
+                raise RuntimeError(
+                    f"Unexpected loader.cas payload format near BASIC address field at offset {offset}."
+                )
+            if len(repl) != len(expected):
+                raise RuntimeError("Internal error: BASIC address replacement length changed.")
+            payload[offset:offset + len(expected)] = repl
+
+        data_spans = [
+            (78, 125, 16),
+            (131, 178, 16),
+            (184, 231, 16),
+            (237, 284, 16),
+            (290, 337, 16),
+            (343, 390, 16),
+            (396, 443, 16),
+            (449, 496, 16),
+            (502, 549, 16),
+            (555, 602, 16),
+            (608, 613, 2),
+        ]
+
+        loader_bytes = bytearray()
+        for start_, end_, item_count in data_spans:
+            chunk = payload[start_:end_].decode("ascii")
+            items = chunk.split(",")
+            if len(items) != item_count:
+                raise RuntimeError(
+                    f"Unexpected loader.cas DATA layout at payload {start_}:{end_}; got {len(items)} items."
+                )
+            loader_bytes.extend(int(x, 16) for x in items)
+
+        if len(loader_bytes) != LOADER_BYTE_COUNT:
+            raise RuntimeError(
+                f"Unexpected loader.cas DATA byte count: got {len(loader_bytes)}, expected {LOADER_BYTE_COUNT}."
+            )
+
+        orig_base = 0x1800
+        internal_offsets = {
+            "load_addr": 0x42,
+            "get_char_filtered": 0x44,
+            "read_hex_nibble": 0x5C,
+            "read_hex8": 0x84,
+            "read_hex16": 0x96,
+        }
+
+        def patch_word_sequences(opcode: int, old_addr: int, new_addr: int) -> int:
+            old_seq = bytes([opcode, old_addr & 0xFF, (old_addr >> 8) & 0xFF])
+            new_seq = bytes([opcode, new_addr & 0xFF, (new_addr >> 8) & 0xFF])
+            idx = 0
+            count = 0
+            while True:
+                idx = loader_bytes.find(old_seq, idx)
+                if idx < 0:
+                    break
+                loader_bytes[idx:idx + 3] = new_seq
+                idx += 3
+                count += 1
+            return count
+
+        patch_word_sequences(0x22, orig_base + internal_offsets["load_addr"], load_addr + internal_offsets["load_addr"])
+        patch_word_sequences(0x2A, orig_base + internal_offsets["load_addr"], load_addr + internal_offsets["load_addr"])
+        patch_word_sequences(0xCD, orig_base + internal_offsets["get_char_filtered"], load_addr + internal_offsets["get_char_filtered"])
+        patch_word_sequences(0xCD, orig_base + internal_offsets["read_hex_nibble"], load_addr + internal_offsets["read_hex_nibble"])
+        patch_word_sequences(0xCD, orig_base + internal_offsets["read_hex8"], load_addr + internal_offsets["read_hex8"])
+        patch_word_sequences(0xCD, orig_base + internal_offsets["read_hex16"], load_addr + internal_offsets["read_hex16"])
+
+        # Patch runtime baud (LD IX,nn). Template uses 8000 baud => DD 21 40 1F
+        baud = int(self.var_xfer_baud.get()) & 0xFFFF
+        baud_pattern = bytes([0xDD, 0x21, 0x40, 0x1F])
+        baud_repl = bytes([0xDD, 0x21, baud & 0xFF, (baud >> 8) & 0xFF])
+        idx = loader_bytes.find(baud_pattern)
+        if idx < 0:
+            raise RuntimeError("Unexpected loader.cas format: loader baud pattern not found.")
+        loader_bytes[idx:idx + 4] = baud_repl
+
+        # Rebuild the ASCII DATA bytes back into the payload
+        offset = 0
+        for start_, end_, item_count in data_spans:
+            chunk_bytes = loader_bytes[offset:offset + item_count]
+            offset += item_count
+            repl = ",".join(f"{b:02X}" for b in chunk_bytes).encode("ascii")
+            if len(repl) != (end_ - start_):
+                raise RuntimeError("Internal error while rebuilding loader.cas DATA lines.")
+            payload[start_:end_] = repl
+
+        if len(payload) != original_payload_len:
+            raise RuntimeError("Internal error: loader payload length changed.")
+
+        return bytes(payload)
+
+    def _build_loader_ascii_frame(self, data: bytes) -> bytes:
+        if not data:
+            raise RuntimeError("Binary is empty.")
+        addr = self._parse_addr() & 0xFFFF
+        size = len(data)
+        if size > 0xFFFF:
+            raise RuntimeError("Binary too large for 16-bit ASCII loader header.")
+        return ("L" + f"{addr:04X}" + f"{size:04X}" + data.hex().upper()).encode("ascii")
+
+    def _send_loader_cas_raw(self, ser: serial.Serial, *, progress_base: float = 0.0, progress_span: float = 100.0):
+        payload = self._build_loader_cas_payload()
+        if not payload:
+            raise RuntimeError("Loader CAS payload is empty.")
+
+        self.log(f"[INFO] Loader CAS raw payload={len(payload)} bytes.")
+        self.log(f"[INFO] Loader load addr: 0x{self._parse_loader_addr():04X}")
+        self.log(f"[INFO] Loader runtime baud: {int(self.var_xfer_baud.get())} 8N2")
+
+        self._stream_raw_payload(
+            ser,
+            payload,
+            "Loader CAS",
+            progress_base=progress_base,
+            progress_span=progress_span,
+            chunk_size=64,
+            final_rts_drop=True,
+        )
+        self.log("[INFO] Loader CAS raw transfer complete.")
+
+    def _send_loader_cas_remote(self, ser: serial.Serial, *, progress_base: float = 0.0, progress_span: float = 50.0):
+        self.log('[INFO] Remote X-07 side: LOAD"COM:" then EXEC&HEE33:RUN')
+        self._type_line(ser, 'LOAD"COM:"')
+        pre_stream_delay = max(float(self.var_line.get()), 0.35)
+        self.log(f"[INFO] Waiting {pre_stream_delay:.2f}s for X-07 to enter LOAD\"COM:\" receive mode...")
+        time.sleep(pre_stream_delay)
+        self._send_loader_cas_raw(ser, progress_base=progress_base, progress_span=progress_span)
+        post_stream_delay = max(0.25, float(self.var_line.get()))
+        time.sleep(post_stream_delay)
+        self._type_line(ser, "EXEC&HEE33:RUN")
+        self.log("[INFO] Remote loader transferred and started.")
+
 
     def _type_line(self, ser: serial.Serial, line: str):
         char_delay = float(self.var_char.get())
@@ -889,10 +1103,55 @@ class X07LoaderApp(tk.Tk):
                 raise InterruptedError("Cancelled during BASIC typing.")
             ser.write(bytes([ch]))
             ser.flush()
+            self._tcdrain(ser)
             time.sleep(char_delay)
         ser.write(b"\r")
         ser.flush()
+        self._tcdrain(ser)
         time.sleep(line_delay)
+
+    def _tcdrain(self, ser: serial.Serial):
+        try:
+            fd = ser.fileno()
+        except Exception:
+            return
+        try:
+            import termios  # type: ignore
+            termios.tcdrain(fd)
+        except Exception:
+            pass
+
+    def _stream_raw_payload(self, ser: serial.Serial, payload: bytes, label: str,
+                            progress_base: float = 0.0, progress_span: float = 100.0,
+                            chunk_size: int = 64, final_rts_drop: bool = False):
+        total = len(payload)
+        if total <= 0:
+            return
+        chunk_size = max(1, int(chunk_size))
+        for offset in range(0, total, chunk_size):
+            if self.cancel_event.is_set():
+                raise InterruptedError(f"Cancelled during {label} send.")
+            chunk = payload[offset:offset + chunk_size]
+            ser.write(chunk)
+            ser.flush()
+            self._tcdrain(ser)
+            sent = min(offset + len(chunk), total)
+            pct = progress_base + (sent / total) * progress_span
+            self._set_progress(pct, f"{label}: {sent}/{total}")
+        if final_rts_drop:
+            try:
+                ser.rts = False
+            except Exception:
+                pass
+
+    def _send_ascii_frame(self, ser: serial.Serial, frame: bytes, label: str,
+                          progress_base: float = 0.0, progress_span: float = 100.0,
+                          chunk_size: int = 256):
+        total = len(frame)
+        if total <= 0:
+            return
+        chunk_size = max(1, int(chunk_size))
+        self._stream_raw_payload(ser, frame, label, progress_base, progress_span, chunk_size)
 
     # ---------------- File pickers ----------------
     def pick_basic(self):
@@ -979,51 +1238,24 @@ class X07LoaderApp(tk.Tk):
         self.log("[INFO] Sent EXEC&HEE33 after BASIC.")
 
     # ---------------- Fast loader + ASM ----------------
-    def send_fast_loader(self):
-        self._run_threaded(self._send_fast_loader_impl, "Send BASIC fast loader")
 
-    def _build_fast_loader_lines(self) -> list[str]:
-        addr = self._parse_addr()
-        xfer_baud = int(self.var_xfer_baud.get())
-        append_run = self.var_append_run.get()
-        lines = [
-            "NEW",
-            "1EXEC&HEE33",
-            f"2Z=&H{addr:04X}",
-            f'3INIT#1,"COM:",{xfer_baud},"G',
-            "4INPUT#1,N",
-            "5FORI=0TO N-1",
-            "6INPUT#1,A$",
-            "7POKE Z+I,VAL(A$)",
-            "8NEXT I",
-            "9EXECZ",
-        ]
-        if append_run:
-            lines.append("RUN")
-        return lines
+    def send_fast_loader(self):
+        self._run_threaded(self._send_fast_loader_impl, 'Send ASM loader (LOAD"COM:")')
 
     def _send_fast_loader_impl(self):
-        self._set_status("typing fast loader")
-        loader_lines = self._build_fast_loader_lines()
-        total = max(1, len(loader_lines))
-        self._set_progress(0, "typing loader...")
+        self._set_status("sending loader CAS raw")
+        self._set_progress(0, "sending loader CAS...")
 
         try:
             with self._open_for_typing() as ser:
-                for i, l in enumerate(loader_lines, start=1):
-                    if self.cancel_event.is_set():
-                        raise InterruptedError("Cancelled during loader typing.")
-                    self._type_line(ser, l)
-                    self._set_progress((i / total) * 100.0, f"Loader {i}/{total} lines")
+                self.log(f"[INFO] Opened {ser.port} for loader raw send: {ser.baudrate} 8N2.")
+                self._send_loader_cas_raw(ser)
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
-        self._set_progress(100.0, "loader done")
-        if self.var_append_run.get():
-            self.log("[INFO] Loader typed and started (RUN).")
-        else:
-            self.log("[INFO] Loader typed (no RUN). Start manually if needed.")
+        self._set_progress(100.0, "loader send done")
+        self.log("[INFO] Loader raw send complete.")
 
     def send_bin_only(self):
         if not self.bin_file or not self.bin_file.exists():
@@ -1032,35 +1264,23 @@ class X07LoaderApp(tk.Tk):
         self._run_threaded(self._send_bin_only_impl, "Send ASM (loader running)")
 
     def _send_bin_only_impl(self):
-        self._set_status("transferring ASM (.bin)")
-        self._set_progress(0, "starting...")
+        self._set_status("transferring ASM via ASCII loader")
+        self._set_progress(0, "building frame...")
 
         data = self.bin_file.read_bytes()
-        n = len(data)
-        if n <= 0:
-            raise RuntimeError("Binary is empty.")
+        frame = self._build_loader_ascii_frame(data)
+        total = len(frame)
+        primer_len = len(ASM_PRIMER)
 
-        addr = self._parse_addr()
-        self.log(f"[INFO] BIN size: {n} bytes. Target load: 0x{addr:04X}")
+        self.log(f"[INFO] BIN size: {len(data)} bytes. Target load: 0x{self._parse_addr():04X}")
+        self.log(f"[INFO] Sending ASCII loader frame: {total} chars @ {int(self.var_xfer_baud.get())} 8N2.")
+        self.log(f"[INFO] Sending primer first: {primer_len} bytes of ignored non-sync data.")
 
         try:
-            with self._open_for_typing() as ser:
-                self._switch_to_xfer(ser)
-                self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
-                time.sleep(self.var_post.get())
-
-                ser.write(f"{n}\r".encode("ascii"))
-                ser.flush()
-                time.sleep(0.01)
-
-                for i, b in enumerate(data, start=1):
-                    if self.cancel_event.is_set():
-                        raise InterruptedError("Cancelled during ASM transfer.")
-                    ser.write(f"{b}\r".encode("ascii"))
-                    ser.flush()
-                    if self.var_byte.get() > 0:
-                        time.sleep(self.var_byte.get())
-                    self._set_progress((i / n) * 100.0, f"ASM {i}/{n} bytes")
+            with self._open_for_raw() as ser:
+                self._prime_loader_xfer(ser)
+                self._stream_raw_payload(ser, ASM_PRIMER, "ASM primer", progress_base=0.0, progress_span=10.0, chunk_size=256)
+                self._send_ascii_frame(ser, frame, "ASM frame", progress_base=10.0, progress_span=90.0, chunk_size=256)
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
@@ -1075,45 +1295,25 @@ class X07LoaderApp(tk.Tk):
         self._run_threaded(self._send_loader_and_bin_impl, "One click: loader + ASM")
 
     def _send_loader_and_bin_impl(self):
-        self._set_status("typing loader + transferring ASM")
+        self._set_status("sending loader CAS + ASM")
         self._set_progress(0, "starting...")
 
         data = self.bin_file.read_bytes()
-        n = len(data)
-        if n <= 0:
-            raise RuntimeError("Binary is empty.")
-
-        loader_lines = self._build_fast_loader_lines()
-        total_loader = max(1, len(loader_lines))
+        frame = self._build_loader_ascii_frame(data)
+        total = len(frame)
+        primer_len = len(ASM_PRIMER)
 
         try:
             with self._open_for_typing() as ser:
-                for i, l in enumerate(loader_lines, start=1):
-                    if self.cancel_event.is_set():
-                        raise InterruptedError("Cancelled during loader typing.")
-                    self._type_line(ser, l)
-                    self._set_progress((i / total_loader) * 50.0, f"Loader {i}/{total_loader} lines")
-
-                if not self.var_append_run.get():
-                    self.log("[WARN] Loader typed without RUN. Enable Append RUN or start manually.")
-                    return
-
-                self._switch_to_xfer(ser)
-                self.log(f"[INFO] Switched to transfer: {ser.baudrate} 7E1.")
-                time.sleep(self.var_post.get())
-
-                ser.write(f"{n}\r".encode("ascii"))
-                ser.flush()
-                time.sleep(0.01)
-
-                for i, b in enumerate(data, start=1):
-                    if self.cancel_event.is_set():
-                        raise InterruptedError("Cancelled during ASM transfer.")
-                    ser.write(f"{b}\r".encode("ascii"))
-                    ser.flush()
-                    if self.var_byte.get() > 0:
-                        time.sleep(self.var_byte.get())
-                    self._set_progress(50.0 + (i / n) * 50.0, f"ASM {i}/{n} bytes")
+                self.log(f"[INFO] Opened {ser.port} for one-click: {ser.baudrate} 8N2.")
+                self._send_loader_cas_remote(ser, progress_base=0.0, progress_span=50.0)
+                self._set_progress(50.0, "loader started")
+            time.sleep(POST_LOADER_EXEC_DELAY_S)
+            with self._open_for_raw() as ser:
+                self._prime_loader_xfer(ser)
+                self.log(f"[INFO] Sending primer first: {primer_len} bytes of ignored non-sync data.")
+                self._stream_raw_payload(ser, ASM_PRIMER, "ASM primer", progress_base=50.0, progress_span=5.0, chunk_size=256)
+                self._send_ascii_frame(ser, frame, "ASM frame", progress_base=55.0, progress_span=45.0, chunk_size=256)
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
@@ -1165,46 +1365,15 @@ class X07LoaderApp(tk.Tk):
 
         try:
             with self._open_for_typing() as ser:
-                sent = 0
-                chunk_size = 64
-
-                while sent < total:
-                    if self.cancel_event.is_set():
-                        raise InterruptedError("Cancelled during CAS/K7 transfer.")
-
-                    end = min(total, sent + chunk_size)
-                    ser.write(payload[sent:end])
-                    ser.flush()
-
-                    if HAS_TERMIOS:
-                        try:
-                            termios.tcdrain(ser.fileno())
-                        except Exception:
-                            pass
-
-                    sent = end
-                    self._set_progress((sent / total) * 100.0, f'CAS/K7 send {sent}/{total} bytes')
-
-                ser.flush()
-
-                if HAS_TERMIOS:
-                    try:
-                        termios.tcdrain(ser.fileno())
-                    except Exception:
-                        pass
-
-                deadline = time.time() + 2.0
-                while getattr(ser, "out_waiting", 0) > 0 and time.time() < deadline:
-                    time.sleep(0.01)
-
-                time.sleep(0.3)
-
-                if self.var_rtscts.get():
-                    try:
-                        ser.rts = False
-                        time.sleep(0.2)
-                    except Exception:
-                        pass
+                self._stream_raw_payload(
+                    ser,
+                    payload,
+                    'CAS/K7 send',
+                    progress_base=0.0,
+                    progress_span=100.0,
+                    chunk_size=64,
+                    final_rts_drop=True,
+                )
 
         except (SerialException, OSError) as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
@@ -1369,6 +1538,10 @@ class X07LoaderApp(tk.Tk):
             self._kbd_send_byte(KEY_INS)
             return "break"
         if k == "Delete":
+            self._kbd_send_byte(KEY_DEL)
+            return "break"
+        if k == "BackSpace":
+            self._kbd_send_byte(KEY_LEFT)
             self._kbd_send_byte(KEY_DEL)
             return "break"
         if k in ("Return", "KP_Enter"):
