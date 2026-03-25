@@ -4,36 +4,37 @@
 start:
     ei
 
-    ; Init COM via ROM
+    ; Init COM via ROM, dans un slot secondaire
     ld de,DEV_COM_TABLE
     xor a
-    ld b,"B"	; 8N2
-    ld ix,8000	; 8000 baud
-    ld iy,SYS_KBNTAB
+    ld b,"B"                ; 8N2
+    ld ix,8000              ; 8000 baud
+    ld iy,SYS_KBNTAB+8
     call ROM_DEV_OPEN
-    ld de,SYS_KBNTAB
+
+    ld de,SYS_KBNTAB+8
     call ROM_DEV_ASSIGN
 
-; ----------------------------------------
+; ------------------------------------------------------------
 ; Attente synchro 'L'
 ; BREAK => retour BASIC
-; ----------------------------------------
+; ------------------------------------------------------------
 wait_sync:
     call get_char_filtered
     ret c
     cp 'L'
     jr nz,wait_sync
 
-; ----------------------------------------
+; ------------------------------------------------------------
 ; Lecture adresse AAAA -> HL
-; ----------------------------------------
+; ------------------------------------------------------------
     call read_hex16
     ret c
     ld (load_addr),hl
 
-; ----------------------------------------
+; ------------------------------------------------------------
 ; Lecture taille SSSS -> BC
-; ----------------------------------------
+; ------------------------------------------------------------
     call read_hex16
     ret c
     ld b,h
@@ -46,9 +47,9 @@ wait_sync:
 
     ld hl,(load_addr)
 
-; ----------------------------------------
+; ------------------------------------------------------------
 ; Réception des données
-; ----------------------------------------
+; ------------------------------------------------------------
 recv_loop:
     call read_hex8
     ret c
@@ -61,19 +62,30 @@ recv_loop:
     or c
     jr nz,recv_loop
 
-	ld hl,(load_addr)
+; ------------------------------------------------------------
+; Restaurer le device courant console avant de lancer le programme
+; ------------------------------------------------------------
+    ld de,DEV_CON_TABLE
+    xor a
+    ld iy,SYS_KBNTAB
+    call ROM_DEV_OPEN
+
+    ld de,SYS_KBNTAB
+    call ROM_DEV_ASSIGN
+
+    ld hl,(load_addr)
     jp (hl)
 
 load_addr:
     .dw 0
 
-; ----------------------------------------
+; ------------------------------------------------------------
 ; Lit un caractère via ROM_DEV_GETC
 ; Ignore CR / LF / espace
 ; Retour :
 ;   A = caractère
 ;   Carry = 1 si BREAK
-; ----------------------------------------
+; ------------------------------------------------------------
 get_char_filtered:
 .loop:
     ld a,(SYS_BREAKFLAG)
@@ -93,12 +105,12 @@ get_char_filtered:
     and a                   ; Carry=0
     ret
 
-; ----------------------------------------
+; ------------------------------------------------------------
 ; Lit un nibble hex ASCII
 ; Retour :
 ;   A = 0..15
 ;   Carry = 1 si BREAK
-; ----------------------------------------
+; ------------------------------------------------------------
 read_hex_nibble:
 .loop:
     call get_char_filtered
@@ -133,10 +145,10 @@ read_hex_nibble:
     and a
     ret
 
-; ----------------------------------------
+; ------------------------------------------------------------
 ; Lit 2 caractères hex -> A
 ; Carry = 1 si BREAK
-; ----------------------------------------
+; ------------------------------------------------------------
 read_hex8:
     call read_hex_nibble
     ret c
@@ -147,7 +159,7 @@ read_hex8:
     push af
 
     call read_hex_nibble
-    ret c
+    jr c,.abort
     ld e,a
 
     pop af
@@ -155,10 +167,15 @@ read_hex8:
     and a
     ret
 
-; ----------------------------------------
+.abort:
+    pop af
+    scf
+    ret
+
+; ------------------------------------------------------------
 ; Lit 4 caractères hex -> HL
 ; Carry = 1 si BREAK
-; ----------------------------------------
+; ------------------------------------------------------------
 read_hex16:
     call read_hex8
     ret c
