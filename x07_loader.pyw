@@ -32,7 +32,6 @@ DEFAULT_LOADER_ADDR = 0x1800
 POST_LOADER_EXEC_DELAY_S = 3.0
 ASM_PRIMER = b"X" * 1024
 LOADER_CAS_NAME = "loader.cas"
-LOADER_BYTE_COUNT = 162
 
 CAS_FIXED_BASE = 0x0010  # fixed (validated for SEND)
 SAVE_IDLE_TIMEOUT_S = 1.25  # end capture if no bytes for this duration (after any data received)
@@ -515,7 +514,7 @@ class X07LoaderApp(tk.Tk):
 
         ttk.Label(
             r2,
-            text='Note: BASIC TXT and REMOTE KEYBOARD use SLAVE mode (INIT#5,"COM:" then EXEC&HEE1F). ASM uses loader.cas + ASCII fast loader.',
+            text='Note: BASIC TXT and REMOTE KEYBOARD use SLAVE mode (INIT#5,"COM:" then EXEC&HEE1F), ASM uses loader.cas + ASCII fast loader.',
         ).pack(side="left", padx=(10, 0))
 
         # ---- BASIC ----
@@ -552,6 +551,8 @@ class X07LoaderApp(tk.Tk):
         btn_recv_cas = ttk.Button(rc, text='Receive raw (SAVE "COM:")', command=self.receive_cas_raw)
         btn_recv_cas.pack(side="left", padx=(6, 0))
         self._transfer_controls.append(btn_recv_cas)
+
+        ttk.Label(cas, text="Send base: fixed 0x0010 (validated). Receive: saves as CAS with D3 header + stream.").pack(anchor="w", pady=(4, 0))
 
         # TXT/BAS (RIGHT)
         txt = ttk.LabelFrame(right, text="Text listing (.txt/.bas) via SLAVE mode", padding=6)
@@ -705,8 +706,7 @@ class X07LoaderApp(tk.Tk):
         self.log('SLAVE mode (BASIC TXT + REMOTE KEYBOARD): INIT#5,"COM:" then EXEC&HEE1F (user guide p.119).')
         self.log('CAS/K7 raw stream: use LOAD"COM:" or SAVE"COM:" on X-07, then send/receive raw bytes on PC.')
         self.log("Exit slave: EXEC&HEE33 (remote) or power cycle.")
-        self.log('Enable "RTS/CTS cable" when using a hardware-handshaked cable. Delay fields stay available and are still used for typing / loader send.')
-        self.log("")
+        self.log("---")
 
     # ---------------- UI enabling/disabling ----------------
     def _set_controls_enabled(self, enabled: bool):
@@ -946,66 +946,83 @@ class X07LoaderApp(tk.Tk):
         original_payload_len = len(payload)
 
         load_addr = self._parse_loader_addr() & 0xFFFF
-        end_addr = (load_addr + LOADER_BYTE_COUNT - 1) & 0xFFFF
 
-        # Patch inside the raw payload
-        ascii_addr_offsets = [
-            (9,  b"&H1800"),  # CLEAR
-            (23, b"&H1800"),  # FOR start
-            (30, b"&H18A1"),  # FOR end
-            (66, b"&H1800"),  # EXEC
-        ]
-        ascii_addr_values = [
-            f"&H{load_addr:04X}".encode("ascii"),
-            f"&H{load_addr:04X}".encode("ascii"),
-            f"&H{end_addr:04X}".encode("ascii"),
-            f"&H{load_addr:04X}".encode("ascii"),
-        ]
-        for (offset, expected), repl in zip(ascii_addr_offsets, ascii_addr_values):
-            if payload[offset:offset + len(expected)] != expected:
+        # Parse BASIC tokenized lines dynamically so loader.cas updates stay robust.
+        lines = []
+        pos = 0
+        while pos + 4 <= len(payload):
+            next_ptr = payload[pos] | (payload[pos + 1] << 8)
+            if next_ptr == 0:
+                break
+            line_no = payload[pos + 2] | (payload[pos + 3] << 8)
+            end = pos + 4
+            while end < len(payload) and payload[end] != 0:
+                end += 1
+            if end >= len(payload):
+                raise RuntimeError("Unexpected loader.cas format: unterminated BASIC line in payload.")
+            content_start = pos + 4
+            content_end = end
+            lines.append({
+                "line_no": line_no,
+                "start": pos,
+                "content_start": content_start,
+                "content_end": content_end,
+            })
+            pos = end + 1
+
+        if not lines:
+            raise RuntimeError("Unexpected loader.cas format: no BASIC payload lines found.")
+
+        def _patch_ascii_field(line_no: int, repl_values):
+            line = next((ln for ln in lines if ln["line_no"] == line_no), None)
+            if line is None:
+                raise RuntimeError(f"Unexpected loader.cas format: BASIC line {line_no} not found.")
+            content = bytes(payload[line["content_start"]:line["content_end"]])
+            fields = list(re.finditer(rb"&H[0-9A-F]{4}", content))
+            if len(fields) < len(repl_values):
                 raise RuntimeError(
-                    f"Unexpected loader.cas payload format near BASIC address field at offset {offset}."
+                    f"Unexpected loader.cas format: BASIC line {line_no} has only {len(fields)} address field(s)."
                 )
-            if len(repl) != len(expected):
-                raise RuntimeError("Internal error: BASIC address replacement length changed.")
-            payload[offset:offset + len(expected)] = repl
+            patched = bytearray(content)
+            for m, repl in zip(fields, repl_values):
+                if len(repl) != len(m.group(0)):
+                    raise RuntimeError("Internal error: BASIC address replacement length changed.")
+                patched[m.start():m.end()] = repl
+            payload[line["content_start"]:line["content_end"]] = patched
 
-        data_spans = [
-            (78, 125, 16),
-            (131, 178, 16),
-            (184, 231, 16),
-            (237, 284, 16),
-            (290, 337, 16),
-            (343, 390, 16),
-            (396, 443, 16),
-            (449, 496, 16),
-            (502, 549, 16),
-            (555, 602, 16),
-            (608, 613, 2),
-        ]
+        data_lines = [ln for ln in lines if ln["line_no"] >= 5]
+        if not data_lines:
+            raise RuntimeError("Unexpected loader.cas format: DATA lines not found.")
 
+        data_spans = []
         loader_bytes = bytearray()
-        for start_, end_, item_count in data_spans:
+        for ln in data_lines:
+            start_ = ln["content_start"]
+            end_ = ln["content_end"]
+            if payload[start_] == 0x83:  # DATA token
+                start_ += 1
             chunk = payload[start_:end_].decode("ascii")
-            items = chunk.split(",")
-            if len(items) != item_count:
-                raise RuntimeError(
-                    f"Unexpected loader.cas DATA layout at payload {start_}:{end_}; got {len(items)} items."
-                )
+            items = chunk.split(",") if chunk else []
+            data_spans.append((start_, end_, len(items)))
             loader_bytes.extend(int(x, 16) for x in items)
 
-        if len(loader_bytes) != LOADER_BYTE_COUNT:
-            raise RuntimeError(
-                f"Unexpected loader.cas DATA byte count: got {len(loader_bytes)}, expected {LOADER_BYTE_COUNT}."
-            )
+        loader_byte_count = len(loader_bytes)
+        if loader_byte_count <= 0:
+            raise RuntimeError("Unexpected loader.cas format: no DATA bytes found.")
+
+        end_addr = (load_addr + loader_byte_count - 1) & 0xFFFF
+
+        _patch_ascii_field(1, [f"&H{load_addr:04X}".encode("ascii")])  # CLEAR
+        _patch_ascii_field(2, [f"&H{load_addr:04X}".encode("ascii"), f"&H{end_addr:04X}".encode("ascii")])  # FOR
+        _patch_ascii_field(4, [f"&H{load_addr:04X}".encode("ascii")])  # EXEC
 
         orig_base = 0x1800
         internal_offsets = {
-            "load_addr": 0x42,
-            "get_char_filtered": 0x44,
-            "read_hex_nibble": 0x5C,
-            "read_hex8": 0x84,
-            "read_hex16": 0x96,
+            "load_addr": 0x53,
+            "get_char_filtered": 0x55,
+            "read_hex_nibble": 0x6D,
+            "read_hex8": 0x95,
+            "read_hex16": 0xAB,
         }
 
         def patch_word_sequences(opcode: int, old_addr: int, new_addr: int) -> int:
@@ -1029,16 +1046,14 @@ class X07LoaderApp(tk.Tk):
         patch_word_sequences(0xCD, orig_base + internal_offsets["read_hex8"], load_addr + internal_offsets["read_hex8"])
         patch_word_sequences(0xCD, orig_base + internal_offsets["read_hex16"], load_addr + internal_offsets["read_hex16"])
 
-        # Patch runtime baud (LD IX,nn). Template uses 8000 baud => DD 21 40 1F
         baud = int(self.var_xfer_baud.get()) & 0xFFFF
-        baud_pattern = bytes([0xDD, 0x21, 0x40, 0x1F])
+        baud_pattern = bytes([0xDD, 0x21, 0x40, 0x1F])  # template uses 8000 baud
         baud_repl = bytes([0xDD, 0x21, baud & 0xFF, (baud >> 8) & 0xFF])
         idx = loader_bytes.find(baud_pattern)
         if idx < 0:
             raise RuntimeError("Unexpected loader.cas format: loader baud pattern not found.")
         loader_bytes[idx:idx + 4] = baud_repl
 
-        # Rebuild the ASCII DATA bytes back into the payload
         offset = 0
         for start_, end_, item_count in data_spans:
             chunk_bytes = loader_bytes[offset:offset + item_count]
@@ -1151,6 +1166,7 @@ class X07LoaderApp(tk.Tk):
         if total <= 0:
             return
         chunk_size = max(1, int(chunk_size))
+        # No additional per-character delay for ASM loader/data transfer.
         self._stream_raw_payload(ser, frame, label, progress_base, progress_span, chunk_size)
 
     # ---------------- File pickers ----------------
