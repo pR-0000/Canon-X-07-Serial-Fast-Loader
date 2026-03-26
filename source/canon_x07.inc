@@ -72,6 +72,7 @@ SYS_RAMEND             EQU $0212   ; end of file RAM area
 SYS_LCD_MIRROR         EQU $0214   ; $0214..$0263
 
 ; --- T6834 communication scratch (used by BASIC; you can reuse if careful)
+SYS_INTIMAG				EQU $026C	; per system-zone dump
 SYS_T6834_NREPLY        EQU $026D   ; number of reply bytes expected
 SYS_T6834_REPLYBUF      EQU $026E   ; default reply buffer (1st)
 SYS_T6834_REPLYBUF2     EQU $0507   ; second reply buffer
