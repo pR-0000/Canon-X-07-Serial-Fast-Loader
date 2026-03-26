@@ -5,24 +5,47 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Protocol
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-try:
-    import serial
-    import serial.tools.list_ports
-    from serial.serialutil import SerialException
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyserial"])
-    import serial
-    import serial.tools.list_ports
-    from serial.serialutil import SerialException
+IS_MACOS = sys.platform == "darwin"
 
 try:
     import termios
     HAS_TERMIOS = True
 except ImportError:
+    termios = None  # type: ignore[assignment]
     HAS_TERMIOS = False
+
+try:
+    import serial
+    import serial.tools.list_ports
+    from serial.serialutil import SerialException
+    HAS_PYSERIAL = True
+except ImportError:
+    HAS_PYSERIAL = False
+    if not (IS_MACOS and HAS_TERMIOS):
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyserial"])
+        import serial
+        import serial.tools.list_ports
+        from serial.serialutil import SerialException
+        HAS_PYSERIAL = True
+    else:
+        serial = None  # type: ignore[assignment]
+        SerialException = OSError  # type: ignore[misc,assignment]
+
+DARWIN_TERMIOS_AVAILABLE = False
+if IS_MACOS and HAS_TERMIOS:
+    try:
+        import array
+        import fcntl
+        import os
+        DARWIN_TERMIOS_AVAILABLE = True
+    except ImportError:
+        DARWIN_TERMIOS_AVAILABLE = False
+
+SERIAL_ERRORS = (SerialException, OSError) if HAS_PYSERIAL else (OSError,)
 
 # ---------- Defaults ----------
 DEFAULT_CHAR_DELAY_S = 0.04
@@ -30,11 +53,206 @@ DEFAULT_LINE_DELAY_S = 0.20
 DEFAULT_LOAD_ADDR = 0x2000
 DEFAULT_LOADER_ADDR = 0x1800
 POST_LOADER_EXEC_DELAY_S = 3.0
-ASM_PRIMER = b"X" * 1024
 LOADER_CAS_NAME = "loader.cas"
 
+BASIC_START = 0x0553
 CAS_FIXED_BASE = 0x0010  # fixed (validated for SEND)
 SAVE_IDLE_TIMEOUT_S = 1.25  # end capture if no bytes for this duration (after any data received)
+
+
+class SerialPortLike(Protocol):
+    port: str
+    baudrate: int
+    timeout: float | None
+    rts: bool
+
+    def write(self, data: bytes) -> int:
+        ...
+
+    def flush(self) -> None:
+        ...
+
+    def read(self, size: int = 1) -> bytes:
+        ...
+
+    def close(self) -> None:
+        ...
+
+    def fileno(self) -> int:
+        ...
+
+    def reset_input_buffer(self) -> None:
+        ...
+
+    def reset_output_buffer(self) -> None:
+        ...
+
+    def __enter__(self):
+        ...
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        ...
+
+
+def serial_backend_summary() -> str:
+    if IS_MACOS and DARWIN_TERMIOS_AVAILABLE and HAS_PYSERIAL:
+        return "termios preferred on macOS (pyserial fallback available)"
+    if IS_MACOS and DARWIN_TERMIOS_AVAILABLE:
+        return "termios on macOS"
+    if HAS_PYSERIAL:
+        return "pyserial"
+    return "unavailable"
+
+
+if IS_MACOS and DARWIN_TERMIOS_AVAILABLE:
+    IOSSIOSPEED = 0x80045402  # _IOW('T', 2, speed_t)
+
+    class MacTermiosSerial:
+        def __init__(self, port: str, baudrate: int, *, timeout: float | None = 0.2, rtscts: bool = False):
+            self.port = port
+            self.baudrate = int(baudrate)
+            self._termios_backend = True
+            self._timeout = timeout
+            self._rtscts = bool(rtscts)
+            self._fd: int | None = None
+            self._rts = True
+
+            try:
+                self._fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY)
+                self._configure_port()
+            except Exception:
+                self.close()
+                raise
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            self.close()
+
+        def _require_open_fd(self) -> int:
+            if self._fd is None:
+                raise OSError("Serial port is closed.")
+            return self._fd
+
+        @property
+        def timeout(self) -> float | None:
+            return self._timeout
+
+        @timeout.setter
+        def timeout(self, value: float | None) -> None:
+            self._timeout = None if value is None else max(0.0, float(value))
+            if self._fd is not None:
+                self._configure_port()
+
+        @property
+        def rts(self) -> bool:
+            return self._rts
+
+        @rts.setter
+        def rts(self, value: bool) -> None:
+            self._rts = bool(value)
+            self._set_rts_state()
+
+        def _configure_port(self) -> None:
+            fd = self._require_open_fd()
+            iflag, oflag, cflag, lflag, ispeed, ospeed, cc = termios.tcgetattr(fd)
+
+            cflag |= termios.CLOCAL | termios.CREAD
+
+            for flag_name in ("ICANON", "ECHO", "ECHOE", "ECHOK", "ECHONL", "ISIG", "IEXTEN"):
+                if hasattr(termios, flag_name):
+                    lflag &= ~getattr(termios, flag_name)
+            for flag_name in ("OPOST", "ONLCR", "OCRNL"):
+                if hasattr(termios, flag_name):
+                    oflag &= ~getattr(termios, flag_name)
+            for flag_name in ("INLCR", "IGNCR", "ICRNL", "IGNBRK", "IXON", "IXOFF", "IXANY",
+                              "INPCK", "ISTRIP", "BRKINT", "PARMRK"):
+                if hasattr(termios, flag_name):
+                    iflag &= ~getattr(termios, flag_name)
+
+            cflag &= ~termios.CSIZE
+            cflag |= termios.CS8
+            cflag &= ~(termios.PARENB | termios.PARODD)
+            cflag |= termios.CSTOPB
+
+            for flow_flag in ("CRTSCTS", "CNEW_RTSCTS"):
+                if hasattr(termios, flow_flag):
+                    if self._rtscts:
+                        cflag |= getattr(termios, flow_flag)
+                    else:
+                        cflag &= ~getattr(termios, flow_flag)
+                    break
+
+            if self._timeout is None:
+                vmin = 1
+                vtime = 0
+            else:
+                vmin = 0
+                vtime = min(255, max(0, int(round(self._timeout * 10))))
+                if self._timeout > 0 and vtime == 0:
+                    vtime = 1
+            cc[termios.VMIN] = vmin
+            cc[termios.VTIME] = vtime
+
+            baud_const = getattr(termios, f"B{self.baudrate}", None)
+            custom_baud = None
+            if baud_const is None:
+                baud_const = getattr(termios, "B38400", None)
+                if baud_const is None:
+                    raise RuntimeError(f"Unsupported baud rate: {self.baudrate}")
+                custom_baud = self.baudrate
+
+            ispeed = baud_const
+            ospeed = baud_const
+            termios.tcsetattr(fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, ispeed, ospeed, cc])
+
+            if custom_baud is not None:
+                fcntl.ioctl(fd, IOSSIOSPEED, array.array("i", [custom_baud]), True)
+
+        def _set_rts_state(self) -> None:
+            fd = self._fd
+            if fd is None:
+                return
+            request = getattr(termios, "TIOCMBIS", None) if self._rts else getattr(termios, "TIOCMBIC", None)
+            bit = getattr(termios, "TIOCM_RTS", None)
+            if request is None or bit is None:
+                return
+            try:
+                fcntl.ioctl(fd, request, array.array("I", [bit]), True)
+            except Exception:
+                pass
+
+        def fileno(self) -> int:
+            return self._require_open_fd()
+
+        def write(self, data: bytes) -> int:
+            fd = self._require_open_fd()
+            view = memoryview(data)
+            total = 0
+            while total < len(view):
+                total += os.write(fd, view[total:])
+            return total
+
+        def flush(self) -> None:
+            termios.tcdrain(self._require_open_fd())
+
+        def read(self, size: int = 1) -> bytes:
+            return os.read(self._require_open_fd(), max(1, int(size)))
+
+        def reset_input_buffer(self) -> None:
+            termios.tcflush(self._require_open_fd(), termios.TCIFLUSH)
+
+        def reset_output_buffer(self) -> None:
+            termios.tcflush(self._require_open_fd(), termios.TCOFLUSH)
+
+        def close(self) -> None:
+            if self._fd is None:
+                return
+            try:
+                os.close(self._fd)
+            finally:
+                self._fd = None
 
 # ---------- X-07 key codes ----------
 KEY_ON_BREAK = 0x01
@@ -264,6 +482,177 @@ X07_ESCAPE_MAP = {
 
 _X07_UNICODE_KEYS = sorted(X07_UNICODE_MAP, key=len, reverse=True)
 _X07_ESCAPE_KEYS = sorted(X07_ESCAPE_MAP, key=len, reverse=True)
+X07_BYTE_TO_UNICODE = {value: key for key, value in X07_UNICODE_MAP.items()}
+
+X07_BASIC_DETOKEN_TOKENS = (
+    "END", "FOR ", "NEXT ", "DATA ",
+    "INPUT", "DIM ", "READ ", "LET ",
+    "GOTO ", "RUN ", "IF ", "RESTORE ",
+    "GOSUB ", "RETURN", "REM", "STOP",
+    " ELSE ", "TR", "MOTOR ", "DEFSTR ",
+    "DEFINT ", "DEFSNG ", "DEFDBL ", "LINE ",
+    "ERROR ", "RESUME ", "OUT ", "ON ",
+    "LPRINT", "DEFFN", "POKE ", "PRINT",
+    "CONT", "LIST ", "LLIST ", "CLEAR ",
+    "CIRCLE", "CONSOLE", "CLS", "COLOR ",
+    "EXEC ", "LOCATE ", "PSET", "PRESET",
+    "OFF", "SLEEP", "DIR", "DELETE ",
+    "FSET ", "PAINT ", "LOAD", "SAVE",
+    "INIT", "ERASE ", "BEEP ", "CLOAD",
+    "CSAVE", "NEW", "TAB(", " TO ",
+    "FN", " USING", "ERL", " ERROR",
+    "STRING$", "INSTR", "INKEY$", "INP",
+    "VARPTR", "USR", "SNS", "ALM$",
+    "DATE$", "TIME$", "START$", "FONT$",
+    "KEY$", "SCREEN ", " THEN ", "NOT ",
+    " STEP ", "+", "-", "*",
+    "/", "^", " AND ", " OR ",
+    " XOR ", " EQU ", " MOD ", "\\",
+    ">", "=", "<", "SGN",
+    "INT", "ABS", "FRE", "POS",
+    "SQR", "RND", "LOG", "EXP",
+    "COS", "SIN", "TAN", "ATN ",
+    "PEEK", "CINT", "CSNG", "CDBL",
+    "FIX", "LEN", "HEX$", "STR$",
+    "VAL", "ASC", "CHR$", "TKEY",
+    "LEFT$", "RIGHT$", "MID$", "CSRLIN",
+    "STICK", "STRIG", "POINT", "'",
+)
+
+TOKEN_FLAG_TRANSPARENT = 0x01
+TOKEN_FLAG_PREPEND_COLON = 0x02
+TOKEN_FLAG_PREPEND_REM = 0x04
+
+X07_BASIC_TOKEN_SPECS = (
+    ("^", 0xD5, 0),
+    ("\\", 0xDB, 0),
+    ("XOR", 0xD8, 0),
+    ("VARPTR", 0xC4, 0),
+    ("VAL", 0xF4, 0),
+    ("USR", 0xC5, 0),
+    ("USING", 0xBD, 0),
+    ("TR", 0x91, 0),
+    ("TO", 0xBB, 0),
+    ("TKEY", 0xF7, 0),
+    ("TIME$", 0xC9, 0),
+    ("THEN", 0xCE, 0),
+    ("TAN", 0xEA, 0),
+    ("TAB(", 0xBA, 0),
+    ("STRING$", 0xC0, 0),
+    ("STRIG", 0xFD, 0),
+    ("STR$", 0xF3, 0),
+    ("STOP", 0x8F, 0),
+    ("STICK", 0xFC, 0),
+    ("STEP", 0xD0, 0),
+    ("START$", 0xCA, 0),
+    ("SQR", 0xE4, 0),
+    ("SNS", 0xC6, 0),
+    ("SLEEP", 0xAD, 0),
+    ("SIN", 0xE9, 0),
+    ("SGN", 0xDF, 0),
+    ("SCREEN", 0xCD, 0),
+    ("SAVE", 0xB3, 0),
+    ("RUN", 0x89, 0),
+    ("RND", 0xE5, 0),
+    ("RIGHT$", 0xF9, 0),
+    ("RETURN", 0x8D, 0),
+    ("RESUME", 0x99, 0),
+    ("RESTORE", 0x8B, 0),
+    ("REM", 0x8E, TOKEN_FLAG_TRANSPARENT),
+    ("READ", 0x86, 0),
+    ("PSET", 0xAA, 0),
+    ("PRINT", 0x9F, 0),
+    ("PRESET", 0xAB, 0),
+    ("POS", 0xE3, 0),
+    ("POKE", 0x9E, 0),
+    ("POINT", 0xFE, 0),
+    ("PEEK", 0xEC, 0),
+    ("PAINT", 0xB1, 0),
+    ("OUT", 0x9A, 0),
+    ("OR", 0xD7, 0),
+    ("ON", 0x9B, 0),
+    ("OFF", 0xAC, 0),
+    ("NOT", 0xCF, 0),
+    ("NEXT", 0x82, 0),
+    ("NEW", 0xB9, 0),
+    ("MOTOR", 0x92, 0),
+    ("MOD", 0xDA, 0),
+    ("MID$", 0xFA, 0),
+    ("LPRINT", 0x9C, 0),
+    ("LOG", 0xE6, 0),
+    ("LOCATE", 0xA9, 0),
+    ("LOAD", 0xB2, 0),
+    ("LLIST", 0xA2, 0),
+    ("LIST", 0xA1, 0),
+    ("LINE", 0x97, 0),
+    ("LET", 0x87, 0),
+    ("LEN", 0xF1, 0),
+    ("LEFT$", 0xF8, 0),
+    ("KEY$", 0xCC, 0),
+    ("INT", 0xE0, 0),
+    ("INSTR", 0xC1, 0),
+    ("INPUT", 0x84, 0),
+    ("INP", 0xC3, 0),
+    ("INKEY$", 0xC2, 0),
+    ("INIT", 0xB4, 0),
+    ("IF", 0x8A, 0),
+    ("HEX$", 0xF2, 0),
+    ("GOTO", 0x88, 0),
+    ("GOSUB", 0x8C, 0),
+    ("FSET", 0xB0, 0),
+    ("FRE", 0xE2, 0),
+    ("FOR", 0x81, 0),
+    ("FONT$", 0xCB, 0),
+    ("FN", 0xBC, 0),
+    ("FIX", 0xF0, 0),
+    ("EXP", 0xE7, 0),
+    ("EXEC", 0xA8, 0),
+    ("ERROR", 0xBF, 0),
+    ("ERROR", 0x98, 0),
+    ("ERL", 0xBE, 0),
+    ("ERASE", 0xB5, 0),
+    ("EQU", 0xD9, 0),
+    ("END", 0x80, 0),
+    ("ELSE", 0x90, TOKEN_FLAG_PREPEND_COLON),
+    ("DIR", 0xAE, 0),
+    ("DIM", 0x85, 0),
+    ("DELETE", 0xAF, 0),
+    ("DEFSTR", 0x93, 0),
+    ("DEFSNG", 0x95, 0),
+    ("DEFINT", 0x94, 0),
+    ("DEFFN", 0x9D, 0),
+    ("DEFDBL", 0x96, 0),
+    ("DATE$", 0xC8, 0),
+    ("DATA", 0x83, TOKEN_FLAG_TRANSPARENT),
+    ("CSRLIN", 0xFB, 0),
+    ("CSNG", 0xEE, 0),
+    ("CSAVE", 0xB8, 0),
+    ("COS", 0xE8, 0),
+    ("CONT", 0xA0, 0),
+    ("CONSOLE", 0xA5, 0),
+    ("COLOR", 0xA7, 0),
+    ("CLS", 0xA6, 0),
+    ("CLOAD", 0xB7, 0),
+    ("CLEAR", 0xA3, 0),
+    ("CIRCLE", 0xA4, 0),
+    ("CINT", 0xED, 0),
+    ("CHR$", 0xF6, 0),
+    ("CDBL", 0xEF, 0),
+    ("BEEP", 0xB6, 0),
+    ("ATN", 0xEB, 0),
+    ("ASC", 0xF5, 0),
+    ("AND", 0xD6, 0),
+    ("ALM$", 0xC7, 0),
+    ("ABS", 0xE1, 0),
+    (">", 0xDC, 0),
+    ("=", 0xDD, 0),
+    ("<", 0xDE, 0),
+    ("/", 0xD4, 0),
+    ("-", 0xD2, 0),
+    ("+", 0xD1, 0),
+    ("*", 0xD3, 0),
+    ("'", 0xFF, TOKEN_FLAG_TRANSPARENT | TOKEN_FLAG_PREPEND_COLON | TOKEN_FLAG_PREPEND_REM),
+)
 
 
 def _match_escape_token(text: str) -> tuple[int | None, int]:
@@ -279,6 +668,29 @@ def _match_escape_token(text: str) -> tuple[int | None, int]:
     return None, 0
 
 
+def _consume_x07_text_unit(text: str, start: int = 0) -> tuple[int, int]:
+    if start >= len(text):
+        raise ValueError("Start index beyond end of text.")
+
+    if text[start] == "\\":
+        token, consumed = _match_escape_token(text[start + 1:])
+        if token is not None:
+            return token, 1 + consumed
+        return 0x5C, 1
+
+    for key in _X07_UNICODE_KEYS:
+        if text.startswith(key, start):
+            return X07_UNICODE_MAP[key], len(key)
+
+    ch = text[start]
+    code = ord(ch)
+    if ch in "\r\n":
+        return code, 1
+    if 0x20 <= code <= 0x7E:
+        return code, 1
+    return ord("?"), 1
+
+
 def x07_encode_text(text: str) -> bytes:
     """Encode a Python string to Canon X-07 text bytes.
 
@@ -290,45 +702,278 @@ def x07_encode_text(text: str) -> bytes:
     i = 0
     n = len(text)
     while i < n:
-        if text[i] == "\\":
-            token, consumed = _match_escape_token(text[i + 1:])
-            if token is not None:
-                out.append(token)
-                i += 1 + consumed
-                continue
-            out.append(0x5C)
-            i += 1
-            continue
-
-        matched = False
-        for key in _X07_UNICODE_KEYS:
-            if text.startswith(key, i):
-                out.append(X07_UNICODE_MAP[key])
-                i += len(key)
-                matched = True
-                break
-        if matched:
-            continue
-
-        ch = text[i]
-        code = ord(ch)
-        if ch in "\r\n":
-            out.append(code)
-        elif 0x20 <= code <= 0x7E:
-            out.append(code)
-        else:
-            out.append(ord("?"))
-        i += 1
+        token, consumed = _consume_x07_text_unit(text, i)
+        out.append(token)
+        i += consumed
     return bytes(out)
 
 
+def _normalize_basic_source_line(line: str) -> tuple[int, str] | None:
+    line = line.rstrip("\r\n")
+    i = 0
+    while i < len(line) and line[i] == " ":
+        i += 1
+
+    start = i
+    while i < len(line) and line[i].isdigit():
+        i += 1
+
+    if i == start:
+        return None
+
+    line_number = int(line[start:i], 10)
+    if line_number <= 0:
+        return None
+
+    if i < len(line) and line[i] == ":":
+        i += 1
+    while i < len(line) and line[i] == " ":
+        i += 1
+
+    src = line[i:]
+    out: list[str] = []
+    transparent = False
+    in_string = False
+
+    for ch in src:
+        current = "".join(out)
+        if not in_string and not transparent and (
+            current.endswith("'") or current.endswith("DATA") or current.endswith("REM")
+        ):
+            transparent = True
+
+        if ch == '"':
+            in_string = not in_string
+
+        out.append(ch if (in_string or transparent) else ch.upper())
+
+    return line_number, "".join(out)
+
+
+def _tokenize_basic_body(text: str) -> bytes:
+    out = bytearray()
+    i = 0
+    in_string = False
+    transparent = False
+
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            in_string = not in_string
+
+        if not in_string and not transparent and not ch.isdigit():
+            matched = False
+            for token_text, token_value, flags in X07_BASIC_TOKEN_SPECS:
+                if text.startswith(token_text, i):
+                    display_text = X07_BASIC_DETOKEN_TOKENS[token_value - 0x80]
+                    if display_text.startswith(" ") and out and out[-1] == ord(" "):
+                        out.pop()
+                    if flags & TOKEN_FLAG_TRANSPARENT:
+                        transparent = True
+                    if flags & TOKEN_FLAG_PREPEND_COLON:
+                        out.append(ord(":"))
+                    if flags & TOKEN_FLAG_PREPEND_REM:
+                        out.append(0x8E)
+                    out.append(token_value)
+                    i += len(token_text)
+                    if display_text.endswith(" ") and i < len(text) and text[i] == " ":
+                        i += 1
+                    matched = True
+                    break
+            if matched:
+                continue
+
+        value, consumed = _consume_x07_text_unit(text, i)
+        out.append(value)
+        i += consumed
+
+    return bytes(out)
+
+
+def _parse_basic_source(text: str) -> list[tuple[int, str]]:
+    parsed: list[tuple[int, str]] = []
+    last_line_number = 0
+
+    for raw_line in text.splitlines():
+        normalized = _normalize_basic_source_line(raw_line)
+        if normalized is None:
+            continue
+        line_number, body = normalized
+        if line_number > 0xFFFF:
+            raise RuntimeError(f"Line number too large: {line_number}")
+        if line_number <= last_line_number:
+            raise RuntimeError(f"Line numbers must be strictly increasing (got {line_number} after {last_line_number}).")
+        parsed.append((line_number, body))
+        last_line_number = line_number
+
+    if not parsed:
+        raise RuntimeError("No line numbers found.")
+
+    return parsed
+
+
+def build_tokenized_basic_payload(lines: list[tuple[int, str]]) -> bytes:
+    payload = bytearray()
+    line_pointer = BASIC_START
+
+    for line_number, body in lines:
+        encoded = _tokenize_basic_body(body)
+        record_len = 4 + len(encoded) + 1
+        line_pointer += record_len
+        if line_pointer > 0xFFFF:
+            raise RuntimeError("Tokenized BASIC program exceeds 16-bit pointer range.")
+        payload.extend((
+            line_pointer & 0xFF,
+            (line_pointer >> 8) & 0xFF,
+            line_number & 0xFF,
+            (line_number >> 8) & 0xFF,
+        ))
+        payload.extend(encoded)
+        payload.append(0x00)
+
+    payload.extend(b"\x00" * 11)
+    return bytes(payload)
+
+
+def _decode_x07_text_byte(value: int) -> str:
+    if value in X07_BYTE_TO_UNICODE:
+        return X07_BYTE_TO_UNICODE[value]
+    if 0x20 <= value <= 0x7E:
+        return chr(value)
+    return f"\\{value:02X}"
+
+
+def _detokenize_basic_body(content: bytes) -> str:
+    out: list[str] = []
+    insert_space = False
+    last_char = ""
+    quoted = False
+    quoted_until_eol = False
+    colon_pending = False
+    remark_pending = False
+
+    def emit_text(text: str) -> None:
+        nonlocal insert_space, last_char, quoted, quoted_until_eol
+
+        if text and text[0] == " " and last_char == " ":
+            text = text[1:]
+
+        for idx, ch in enumerate(text):
+            if ch == '"':
+                quoted = (not quoted) or quoted_until_eol
+                insert_space = False
+            elif ch == "\n":
+                quoted = False
+                quoted_until_eol = False
+                insert_space = False
+
+            if not quoted and ord(ch) < 0x20 and ch != "\n":
+                out.append(f"\\{ord(ch):02X}")
+            elif quoted:
+                out.append(ch)
+                insert_space = False
+            else:
+                if ch == " " and idx == len(text) - 1:
+                    insert_space = True
+                else:
+                    if insert_space and (ch.isdigit() or ch >= "A"):
+                        out.append(" ")
+                    out.append(ch)
+                    insert_space = False
+            last_char = ch
+
+    for value in content + b"\x00":
+        if colon_pending:
+            colon_pending = False
+            if value == 0x8E:
+                remark_pending = True
+                continue
+            if value != 0x90:
+                emit_text(":")
+        elif remark_pending:
+            remark_pending = False
+            if value != 0xFF:
+                emit_text(":REM")
+                quoted = True
+                quoted_until_eol = True
+
+        if value == ord(":") and not quoted:
+            colon_pending = True
+            continue
+
+        if value == 0x00:
+            emit_text("\n")
+            continue
+
+        token_text: str | None = None
+        if not quoted and value >= 0x80:
+            token_text = X07_BASIC_DETOKEN_TOKENS[value - 0x80]
+            if value in (0x83, 0x8E, 0xFF):
+                quoted = True
+                quoted_until_eol = True
+
+        if token_text is not None:
+            emit_text(token_text)
+        elif value == 0x20:
+            out.append(" ")
+            insert_space = False
+            last_char = " "
+        else:
+            emit_text(_decode_x07_text_byte(value))
+
+    return "".join(out).rstrip("\n")
+
+
+def parse_tokenized_basic_payload(payload: bytes) -> list[tuple[int, bytes]]:
+    lines: list[tuple[int, bytes]] = []
+    pos = 0
+
+    while pos + 4 <= len(payload):
+        next_ptr = payload[pos] | (payload[pos + 1] << 8)
+        if next_ptr == 0:
+            break
+
+        line_number = payload[pos + 2] | (payload[pos + 3] << 8)
+        end = payload.find(b"\x00", pos + 4)
+        if end < 0:
+            raise RuntimeError("Unexpected BASIC payload format: missing line terminator.")
+
+        expected_next_ptr = BASIC_START + end + 1
+        if next_ptr != expected_next_ptr:
+            raise RuntimeError(
+                f"Unexpected BASIC payload format: inconsistent line pointer 0x{next_ptr:04X} "
+                f"(expected 0x{expected_next_ptr:04X})."
+            )
+
+        lines.append((line_number, bytes(payload[pos + 4:end])))
+        pos = end + 1
+
+    if not lines:
+        raise RuntimeError("Unexpected BASIC payload format: no tokenized BASIC lines found.")
+
+    return lines
+
+
+def detokenize_basic_payload(payload: bytes) -> str:
+    lines = parse_tokenized_basic_payload(payload)
+    return "\n".join(f"{line_number} {_detokenize_basic_body(content)}" for line_number, content in lines)
+
+
 def list_serial_ports():
-    ports = [p.device for p in serial.tools.list_ports.comports()]
-    if sys.platform == "darwin":
-        cu_ports = [p for p in ports if p.startswith("/dev/cu.")]
-        if cu_ports:
-            return cu_ports
-    return ports
+    if IS_MACOS and DARWIN_TERMIOS_AVAILABLE:
+        ports = sorted(str(p) for p in Path("/dev").glob("cu.*"))
+        if ports:
+            return ports
+
+    if HAS_PYSERIAL:
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        if IS_MACOS:
+            cu_ports = [p for p in ports if p.startswith("/dev/cu.")]
+            if cu_ports:
+                return cu_ports
+        return ports
+
+    return []
 
 
 def guess_name_in_first_16_bytes(data: bytes, fallback: str) -> str:
@@ -412,8 +1057,8 @@ class X07LoaderApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Canon X-07 Serial Fast Loader")
-        self.geometry("1040x720")
-        self.minsize(920, 620)
+        self.geometry("1040x710")
+        self.minsize(920, 580)
 
         # files
         self.basic_file: Path | None = None
@@ -427,7 +1072,7 @@ class X07LoaderApp(tk.Tk):
 
         # remote keyboard (persistent session)
         self.remote_kbd_on = False
-        self.remote_ser: serial.Serial | None = None
+        self.remote_ser: SerialPortLike | None = None
 
         # widgets
         self._transfer_controls: list[ttk.Widget] = []
@@ -512,11 +1157,6 @@ class X07LoaderApp(tk.Tk):
         btn_disable_slave.pack(side="left", padx=(6, 0))
         self._transfer_controls.append(btn_disable_slave)
 
-        ttk.Label(
-            r2,
-            text='Note: BASIC TXT and REMOTE KEYBOARD use SLAVE mode (INIT#5,"COM:" then EXEC&HEE1F), ASM uses loader.cas + ASCII fast loader.',
-        ).pack(side="left", padx=(10, 0))
-
         # ---- BASIC ----
         basic_box = ttk.LabelFrame(main, text="BASIC", padding=6)
         basic_box.pack(fill="x", pady=(0, 6))
@@ -544,15 +1184,17 @@ class X07LoaderApp(tk.Tk):
         btn_inspect.pack(side="left", padx=(6, 0))
         self._always_enabled_controls.append(btn_inspect)
 
-        btn_send_cas = ttk.Button(rc, text='Send raw (LOAD "COM:")', command=self.send_cas_raw)
+        btn_send_cas = ttk.Button(rc, text="Send raw", command=self.send_cas_raw)
         btn_send_cas.pack(side="left", padx=(6, 0))
         self._transfer_controls.append(btn_send_cas)
 
-        btn_recv_cas = ttk.Button(rc, text='Receive raw (SAVE "COM:")', command=self.receive_cas_raw)
+        btn_recv_cas = ttk.Button(rc, text="Receive raw", command=self.receive_cas_raw)
         btn_recv_cas.pack(side="left", padx=(6, 0))
         self._transfer_controls.append(btn_recv_cas)
 
-        ttk.Label(cas, text="Send base: fixed 0x0010 (validated). Receive: saves as CAS with D3 header + stream.").pack(anchor="w", pady=(4, 0))
+        btn_cas_to_text = ttk.Button(rc, text="Convert to text", command=self.convert_cas_to_text)
+        btn_cas_to_text.pack(side="left", padx=(6, 0))
+        self._transfer_controls.append(btn_cas_to_text)
 
         # TXT/BAS (RIGHT)
         txt = ttk.LabelFrame(right, text="Text listing (.txt/.bas) via SLAVE mode", padding=6)
@@ -570,6 +1212,10 @@ class X07LoaderApp(tk.Tk):
         btn_send_basic = ttk.Button(rb, text="Send BASIC", command=self.send_basic_file)
         btn_send_basic.pack(side="left", padx=(6, 0))
         self._transfer_controls.append(btn_send_basic)
+
+        btn_text_to_cas = ttk.Button(rb, text="Convert to CAS/K7", command=self.convert_basic_to_cas)
+        btn_text_to_cas.pack(side="left", padx=(6, 0))
+        self._transfer_controls.append(btn_text_to_cas)
 
         # ---- ASM ----
         asm = ttk.LabelFrame(main, text="ASM via loader.cas + ASCII fast loader", padding=6)
@@ -617,8 +1263,6 @@ class X07LoaderApp(tk.Tk):
         self.btn_remote_toggle.pack(side="left")
         self._always_enabled_controls.append(self.btn_remote_toggle)
 
-        ttk.Label(rk, text='(requires SLAVE mode: INIT#5,"COM:" then EXEC&HEE1F)').pack(side="left", padx=(10, 0))
-
         row_btns = ttk.Frame(kbd)
         row_btns.pack(fill="x", pady=(6, 0))
 
@@ -665,7 +1309,7 @@ class X07LoaderApp(tk.Tk):
         kbtn("→", lambda: self._kbd_send_byte(KEY_RIGHT), width=3)
 
         ttk.Label(kbd, text="Type here (sent to X-07 while REMOTE KEYBOARD is ON):").pack(anchor="w", pady=(6, 0))
-        self.relay_box = tk.Text(kbd, height=3, wrap="none")
+        self.relay_box = tk.Text(kbd, height=1, wrap="none")
         self.relay_box.pack(fill="x", expand=False)
         self.relay_box.bind("<KeyPress>", self._on_remote_keypress)
         self._kbd_controls.append(self.relay_box)
@@ -683,7 +1327,7 @@ class X07LoaderApp(tk.Tk):
         self.status_var = tk.StringVar(value="Status: idle")
         ttk.Label(bottom, textvariable=self.status_var).pack(anchor="w")
 
-        self.txt = tk.Text(bottom, height=12, wrap="word")
+        self.txt = tk.Text(bottom, height=10, wrap="word")
         self.txt.pack(fill="both", expand=True, pady=(4, 0))
 
         self._set_keyboard_controls_enabled(False)
@@ -702,11 +1346,14 @@ class X07LoaderApp(tk.Tk):
         self.update_idletasks()
 
     def _log_startup_banner(self):
-        self.log("Canon X-07 Serial Fast Loader - ready.")
-        self.log('SLAVE mode (BASIC TXT + REMOTE KEYBOARD): INIT#5,"COM:" then EXEC&HEE1F (user guide p.119).')
-        self.log('CAS/K7 raw stream: use LOAD"COM:" or SAVE"COM:" on X-07, then send/receive raw bytes on PC.')
-        self.log("Exit slave: EXEC&HEE33 (remote) or power cycle.")
-        self.log("---")
+        self.log(f"[INFO] Serial backend: {serial_backend_summary()}.")
+        self.log("[INFO] Quick reminders:")
+        self.log('       Text listing / Remote keyboard: on X-07, run INIT#5,"COM:" then EXEC&HEE1F.')
+        self.log('       Cassette stream PC -> X-07: on X-07, run LOAD"COM:" then click Send raw.')
+        self.log('       Cassette stream X-07 -> PC: on X-07, run SAVE"COM:" then click Receive raw.')
+        self.log("       ASM transfer: send loader.cas first, then send the ASM binary.")
+        self.log("       Cassette files: send uses fixed base 0x0010; receive saves a .cas file with D3 header + raw stream.")
+        self.log("       Exit SLAVE mode: EXEC&HEE33 or power cycle.")
 
     # ---------------- UI enabling/disabling ----------------
     def _set_controls_enabled(self, enabled: bool):
@@ -879,34 +1526,52 @@ class X07LoaderApp(tk.Tk):
             raise RuntimeError("No COM port selected.")
         return p
 
-    def _open_for_typing(self) -> serial.Serial:
+    def _serial_backend_name(self, ser: SerialPortLike | None = None) -> str:
+        if ser is not None:
+            return "termios" if getattr(ser, "_termios_backend", False) else "pyserial"
+        if IS_MACOS and DARWIN_TERMIOS_AVAILABLE and HAS_PYSERIAL:
+            return "termios preferred on macOS (pyserial fallback)"
+        if IS_MACOS and DARWIN_TERMIOS_AVAILABLE:
+            return "termios"
+        if HAS_PYSERIAL:
+            return "pyserial"
+        return "unknown"
+
+    def _open_serial(self, baud: int) -> SerialPortLike:
+        port = self._require_port()
+        timeout = 0.2
+
+        if IS_MACOS and DARWIN_TERMIOS_AVAILABLE:
+            try:
+                return MacTermiosSerial(port, baud, timeout=timeout, rtscts=self.var_rtscts.get())
+            except Exception as e:
+                if HAS_PYSERIAL:
+                    self.log(f"[WARN] termios open failed on {port!r}: {e}. Falling back to pyserial.")
+                else:
+                    raise RuntimeError(f"Cannot open {port!r} with termios backend: {e}") from e
+
+        if not HAS_PYSERIAL:
+            raise RuntimeError("No serial backend available. Install pyserial or use the macOS termios backend.")
+
         return serial.Serial(
-            self._require_port(),
-            int(self.var_typing_baud.get()),
+            port,
+            int(baud),
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_TWO,
-            timeout=0.2,
+            timeout=timeout,
             xonxoff=False,
             rtscts=self.var_rtscts.get(),
             dsrdtr=False,
         )
 
-    def _open_for_raw(self) -> serial.Serial:
-        return serial.Serial(
-            self._require_port(),
-            int(self.var_xfer_baud.get()),
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_TWO,
-            timeout=0.2,
-            xonxoff=False,
-            rtscts=self.var_rtscts.get(),
-            dsrdtr=False,
-        )
+    def _open_for_typing(self) -> SerialPortLike:
+        return self._open_serial(int(self.var_typing_baud.get()))
 
+    def _open_for_raw(self) -> SerialPortLike:
+        return self._open_serial(int(self.var_xfer_baud.get()))
 
-    def _prime_loader_xfer(self, ser: serial.Serial):
+    def _prepare_raw_transfer(self, ser: SerialPortLike):
         try:
             ser.reset_input_buffer()
         except Exception:
@@ -1077,7 +1742,7 @@ class X07LoaderApp(tk.Tk):
             raise RuntimeError("Binary too large for 16-bit ASCII loader header.")
         return ("L" + f"{addr:04X}" + f"{size:04X}" + data.hex().upper()).encode("ascii")
 
-    def _send_loader_cas_raw(self, ser: serial.Serial, *, progress_base: float = 0.0, progress_span: float = 100.0):
+    def _send_loader_cas_raw(self, ser: SerialPortLike, *, progress_base: float = 0.0, progress_span: float = 100.0):
         payload = self._build_loader_cas_payload()
         if not payload:
             raise RuntimeError("Loader CAS payload is empty.")
@@ -1097,7 +1762,7 @@ class X07LoaderApp(tk.Tk):
         )
         self.log("[INFO] Loader CAS raw transfer complete.")
 
-    def _send_loader_cas_remote(self, ser: serial.Serial, *, progress_base: float = 0.0, progress_span: float = 50.0):
+    def _send_loader_cas_remote(self, ser: SerialPortLike, *, progress_base: float = 0.0, progress_span: float = 50.0):
         self.log('[INFO] Remote X-07 side: LOAD"COM:" then EXEC&HEE33:RUN')
         self._type_line(ser, 'LOAD"COM:"')
         pre_stream_delay = max(float(self.var_line.get()), 0.35)
@@ -1110,7 +1775,7 @@ class X07LoaderApp(tk.Tk):
         self.log("[INFO] Remote loader transferred and started.")
 
 
-    def _type_line(self, ser: serial.Serial, line: str):
+    def _type_line(self, ser: SerialPortLike, line: str):
         char_delay = float(self.var_char.get())
         line_delay = float(self.var_line.get())
         for ch in line.encode("ascii", errors="replace"):
@@ -1125,18 +1790,19 @@ class X07LoaderApp(tk.Tk):
         self._tcdrain(ser)
         time.sleep(line_delay)
 
-    def _tcdrain(self, ser: serial.Serial):
+    def _tcdrain(self, ser: SerialPortLike):
         try:
             fd = ser.fileno()
         except Exception:
             return
+        if not HAS_TERMIOS:
+            return
         try:
-            import termios  # type: ignore
             termios.tcdrain(fd)
         except Exception:
             pass
 
-    def _stream_raw_payload(self, ser: serial.Serial, payload: bytes, label: str,
+    def _stream_raw_payload(self, ser: SerialPortLike, payload: bytes, label: str,
                             progress_base: float = 0.0, progress_span: float = 100.0,
                             chunk_size: int = 64, final_rts_drop: bool = False):
         total = len(payload)
@@ -1159,7 +1825,7 @@ class X07LoaderApp(tk.Tk):
             except Exception:
                 pass
 
-    def _send_ascii_frame(self, ser: serial.Serial, frame: bytes, label: str,
+    def _send_ascii_frame(self, ser: SerialPortLike, frame: bytes, label: str,
                           progress_base: float = 0.0, progress_span: float = 100.0,
                           chunk_size: int = 256):
         total = len(frame)
@@ -1168,6 +1834,28 @@ class X07LoaderApp(tk.Tk):
         chunk_size = max(1, int(chunk_size))
         # No additional per-character delay for ASM loader/data transfer.
         self._stream_raw_payload(ser, frame, label, progress_base, progress_span, chunk_size)
+
+    def _build_current_asm_frame(self) -> bytes:
+        if not self.bin_file or not self.bin_file.exists():
+            raise RuntimeError("Select a .bin file first.")
+        data = self.bin_file.read_bytes()
+        frame = self._build_loader_ascii_frame(data)
+        self.log(f"[INFO] BIN size: {len(data)} bytes. Target load: 0x{self._parse_addr():04X}")
+        self.log(f"[INFO] Sending ASCII loader frame: {len(frame)} chars @ {int(self.var_xfer_baud.get())} 8N2.")
+        return frame
+
+    def _send_current_asm_frame(self, frame: bytes, *, progress_base: float = 0.0, progress_span: float = 100.0):
+        with self._open_for_raw() as ser:
+            self.log(f"[INFO] Opened {ser.port} for ASM send: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
+            self._prepare_raw_transfer(ser)
+            self._send_ascii_frame(
+                ser,
+                frame,
+                "ASM frame",
+                progress_base=progress_base,
+                progress_span=progress_span,
+                chunk_size=256,
+            )
 
     # ---------------- File pickers ----------------
     def pick_basic(self):
@@ -1203,6 +1891,105 @@ class X07LoaderApp(tk.Tk):
         self.lbl_cas.config(text=f"Selected CAS/K7: {self.cas_file}")
         self.log(f"[OK] CAS/K7 selected: {self.cas_file}")
 
+    def convert_basic_to_cas(self):
+        if not self.basic_file or not self.basic_file.exists():
+            messagebox.showwarning("Missing BASIC", "Select a BASIC .txt/.bas file first.")
+            return
+
+        p = filedialog.asksaveasfilename(
+            title="Save tokenized cassette stream as",
+            defaultextension=".cas",
+            initialfile=self.basic_file.with_suffix(".cas").name,
+            filetypes=[("CAS/K7", "*.cas *.k7"), ("CAS", "*.cas"), ("K7", "*.k7"), ("All files", "*.*")],
+        )
+        if not p:
+            return
+
+        out_path = Path(p)
+        self._run_threaded(lambda: self._convert_basic_to_cas_impl(out_path), "Convert BASIC to cassette stream")
+
+    def _convert_basic_to_cas_impl(self, out_path: Path):
+        self._set_status("converting BASIC to cassette stream")
+        self._set_progress(0, "reading BASIC listing...")
+
+        source = self.basic_file.read_text(encoding="utf-8", errors="replace")
+        parsed = _parse_basic_source(source)
+        payload = bytearray()
+        line_pointer = BASIC_START
+        total = len(parsed)
+
+        self.log(f"[INFO] Converting BASIC listing: {self.basic_file.name}")
+        self.log(f"[INFO] Output cassette stream: {out_path.name}")
+
+        for idx, (line_number, body) in enumerate(parsed, start=1):
+            if self.cancel_event.is_set():
+                raise InterruptedError("Cancelled during BASIC tokenization.")
+
+            encoded = _tokenize_basic_body(body)
+            record_len = 4 + len(encoded) + 1
+            line_pointer += record_len
+            if line_pointer > 0xFFFF:
+                raise RuntimeError("Tokenized BASIC program exceeds 16-bit pointer range.")
+
+            payload.extend((
+                line_pointer & 0xFF,
+                (line_pointer >> 8) & 0xFF,
+                line_number & 0xFF,
+                (line_number >> 8) & 0xFF,
+            ))
+            payload.extend(encoded)
+            payload.append(0x00)
+
+            self._set_progress((idx / total) * 100.0, f"tokenizing BASIC line {idx}/{total}")
+
+        payload.extend(b"\x00" * 11)
+        out_path.write_bytes(build_cas_header_from_filename(out_path) + bytes(payload))
+        self._set_progress(100.0, "conversion done")
+        self.log(f"[OK] Tokenized BASIC saved: {out_path} ({len(payload)} payload bytes, {total} line(s)).")
+
+    def convert_cas_to_text(self):
+        if not self.cas_file or not self.cas_file.exists():
+            messagebox.showwarning("Missing CAS/K7", "Select a .cas/.k7 file first.")
+            return
+
+        p = filedialog.asksaveasfilename(
+            title="Save BASIC text listing as",
+            defaultextension=".bas",
+            initialfile=self.cas_file.with_suffix(".bas").name,
+            filetypes=[("BASIC", "*.bas *.txt"), ("BAS", "*.bas"), ("Text", "*.txt"), ("All files", "*.*")],
+        )
+        if not p:
+            return
+
+        out_path = Path(p)
+        self._run_threaded(lambda: self._convert_cas_to_text_impl(out_path), "Convert cassette stream to text listing")
+
+    def _convert_cas_to_text_impl(self, out_path: Path):
+        self._set_status("converting cassette stream to BASIC text")
+        self._set_progress(0, "reading cassette stream...")
+
+        data = self.cas_file.read_bytes()
+        if len(data) <= CAS_FIXED_BASE:
+            raise RuntimeError("Selected CAS/K7 file is too short.")
+
+        payload = data[CAS_FIXED_BASE:]
+        lines = parse_tokenized_basic_payload(payload)
+        total = len(lines)
+        text_lines: list[str] = []
+
+        self.log(f"[INFO] Converting cassette stream: {self.cas_file.name}")
+        self.log(f"[INFO] Output BASIC listing: {out_path.name}")
+
+        for idx, (line_number, content) in enumerate(lines, start=1):
+            if self.cancel_event.is_set():
+                raise InterruptedError("Cancelled during BASIC detokenization.")
+            text_lines.append(f"{line_number} {_detokenize_basic_body(content)}")
+            self._set_progress((idx / total) * 100.0, f"detokenizing BASIC line {idx}/{total}")
+
+        out_path.write_text("\n".join(text_lines) + "\n", encoding="utf-8")
+        self._set_progress(100.0, "conversion done")
+        self.log(f"[OK] BASIC listing saved: {out_path} ({total} line(s)).")
+
     # ---------------- Slave mode helper ----------------
     def disable_slave_mode(self):
         self._run_threaded(self._disable_slave_mode_impl, "Disable slave mode (EXEC&HEE33)")
@@ -1213,7 +2000,7 @@ class X07LoaderApp(tk.Tk):
         try:
             with self._open_for_typing() as ser:
                 self._type_line(ser, "EXEC&HEE33")
-        except (SerialException, OSError) as e:
+        except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
         self._set_progress(100, "done")
@@ -1236,7 +2023,7 @@ class X07LoaderApp(tk.Tk):
 
         try:
             with self._open_for_typing() as ser:
-                self.log(f"[INFO] Opened {ser.port} for typing: {ser.baudrate} 8N2.")
+                self.log(f"[INFO] Opened {ser.port} for typing: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
                 for idx, ln in enumerate(lines, start=1):
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during BASIC send.")
@@ -1246,7 +2033,7 @@ class X07LoaderApp(tk.Tk):
                 if self.cancel_event.is_set():
                     raise InterruptedError("Cancelled before EXEC&HEE33.")
                 self._type_line(ser, "EXEC&HEE33")
-        except (SerialException, OSError) as e:
+        except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
@@ -1264,9 +2051,9 @@ class X07LoaderApp(tk.Tk):
 
         try:
             with self._open_for_typing() as ser:
-                self.log(f"[INFO] Opened {ser.port} for loader raw send: {ser.baudrate} 8N2.")
+                self.log(f"[INFO] Opened {ser.port} for loader raw send: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
                 self._send_loader_cas_raw(ser)
-        except (SerialException, OSError) as e:
+        except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
@@ -1283,21 +2070,11 @@ class X07LoaderApp(tk.Tk):
         self._set_status("transferring ASM via ASCII loader")
         self._set_progress(0, "building frame...")
 
-        data = self.bin_file.read_bytes()
-        frame = self._build_loader_ascii_frame(data)
-        total = len(frame)
-        primer_len = len(ASM_PRIMER)
-
-        self.log(f"[INFO] BIN size: {len(data)} bytes. Target load: 0x{self._parse_addr():04X}")
-        self.log(f"[INFO] Sending ASCII loader frame: {total} chars @ {int(self.var_xfer_baud.get())} 8N2.")
-        self.log(f"[INFO] Sending primer first: {primer_len} bytes of ignored non-sync data.")
+        frame = self._build_current_asm_frame()
 
         try:
-            with self._open_for_raw() as ser:
-                self._prime_loader_xfer(ser)
-                self._stream_raw_payload(ser, ASM_PRIMER, "ASM primer", progress_base=0.0, progress_span=10.0, chunk_size=256)
-                self._send_ascii_frame(ser, frame, "ASM frame", progress_base=10.0, progress_span=90.0, chunk_size=256)
-        except (SerialException, OSError) as e:
+            self._send_current_asm_frame(frame)
+        except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
@@ -1314,23 +2091,16 @@ class X07LoaderApp(tk.Tk):
         self._set_status("sending loader CAS + ASM")
         self._set_progress(0, "starting...")
 
-        data = self.bin_file.read_bytes()
-        frame = self._build_loader_ascii_frame(data)
-        total = len(frame)
-        primer_len = len(ASM_PRIMER)
+        frame = self._build_current_asm_frame()
 
         try:
             with self._open_for_typing() as ser:
-                self.log(f"[INFO] Opened {ser.port} for one-click: {ser.baudrate} 8N2.")
+                self.log(f"[INFO] Opened {ser.port} for one-click loader stage: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
                 self._send_loader_cas_remote(ser, progress_base=0.0, progress_span=50.0)
                 self._set_progress(50.0, "loader started")
             time.sleep(POST_LOADER_EXEC_DELAY_S)
-            with self._open_for_raw() as ser:
-                self._prime_loader_xfer(ser)
-                self.log(f"[INFO] Sending primer first: {primer_len} bytes of ignored non-sync data.")
-                self._stream_raw_payload(ser, ASM_PRIMER, "ASM primer", progress_base=50.0, progress_span=5.0, chunk_size=256)
-                self._send_ascii_frame(ser, frame, "ASM frame", progress_base=55.0, progress_span=45.0, chunk_size=256)
-        except (SerialException, OSError) as e:
+            self._send_current_asm_frame(frame, progress_base=50.0, progress_span=50.0)
+        except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
@@ -1381,6 +2151,7 @@ class X07LoaderApp(tk.Tk):
 
         try:
             with self._open_for_typing() as ser:
+                self.log(f"[INFO] Opened {ser.port} for CAS/K7 send: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
                 self._stream_raw_payload(
                     ser,
                     payload,
@@ -1391,7 +2162,7 @@ class X07LoaderApp(tk.Tk):
                     final_rts_drop=True,
                 )
 
-        except (SerialException, OSError) as e:
+        except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
@@ -1425,6 +2196,7 @@ class X07LoaderApp(tk.Tk):
 
         try:
             with self._open_for_typing() as ser:
+                self.log(f"[INFO] Opened {ser.port} for CAS/K7 receive: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
                 ser.timeout = 0.2
                 while True:
                     if self.cancel_event.is_set():
@@ -1449,7 +2221,7 @@ class X07LoaderApp(tk.Tk):
                 except Exception as e:
                     self.log(f"[ERROR] Failed to save partial stream: {e}")
             raise
-        except (SerialException, OSError) as e:
+        except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
@@ -1482,7 +2254,7 @@ class X07LoaderApp(tk.Tk):
     def _remote_keyboard_on(self):
         try:
             self.remote_ser = self._open_for_typing()
-        except (SerialException, OSError) as e:
+        except SERIAL_ERRORS as e:
             self.remote_ser = None
             self.remote_kbd_on = False
             self.btn_remote_toggle.config(text="REMOTE KEYBOARD: OFF")
@@ -1494,7 +2266,10 @@ class X07LoaderApp(tk.Tk):
         self.remote_kbd_on = True
         self.btn_remote_toggle.config(text="REMOTE KEYBOARD: ON")
         self._set_keyboard_controls_enabled(True)
-        self.log(f"[OK] REMOTE KEYBOARD: ON ({self.remote_ser.port} @ {self.remote_ser.baudrate} 8N2).")
+        self.log(
+            f"[OK] REMOTE KEYBOARD: ON ({self.remote_ser.port} @ {self.remote_ser.baudrate} 8N2, "
+            f"{self._serial_backend_name(self.remote_ser)})."
+        )
         self.log('[INFO] Remote keyboard requires SLAVE mode (INIT#5,"COM:" then EXEC&HEE1F).')
 
     def _remote_keyboard_off(self, reason: str = "[OK] REMOTE KEYBOARD: OFF"):
@@ -1515,7 +2290,7 @@ class X07LoaderApp(tk.Tk):
         try:
             self.remote_ser.write(bytes([b & 0xFF]))
             self.remote_ser.flush()
-        except (SerialException, OSError) as e:
+        except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Remote keyboard write failed: {e}")
             self._remote_keyboard_off(reason="[WARN] REMOTE KEYBOARD stopped (write error).")
 
@@ -1525,7 +2300,7 @@ class X07LoaderApp(tk.Tk):
         try:
             self.remote_ser.write(data)
             self.remote_ser.flush()
-        except (SerialException, OSError) as e:
+        except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Remote keyboard write failed: {e}")
             self._remote_keyboard_off(reason="[WARN] REMOTE KEYBOARD stopped (write error).")
 

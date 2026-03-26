@@ -12,6 +12,7 @@ Il prend en charge :
 
 * **BASIC (listing texte)** : envoi d’un fichier `.txt` / `.bas` en le « tapant » ligne par ligne
 * **BASIC (cassette en flux brut)** : envoi *et* réception de fichiers `.cas` / `.k7` via `LOAD"COM:"` et `SAVE"COM:"`
+* **Conversion BASIC** : conversion d’un listing `.txt` / `.bas` en flux cassette tokenisé `.cas` / `.k7`, et inversement
 * **ASM (rapide)** : transfert d’un loader puis envoi rapide d’un binaire `.bin`
 * **Clavier distant (REMOTE KEYBOARD)** : saisie depuis le PC vers le X-07
 
@@ -27,7 +28,8 @@ L’application fournit :
 ### Prérequis
 
 * Python 3.10 ou plus récent
-* `pyserial` (installé automatiquement si nécessaire)
+* `termios` est privilégié sur macOS quand il est disponible
+* `pyserial` reste utilisé ailleurs et sert de repli si nécessaire
 
 ---
 
@@ -196,6 +198,42 @@ Fonctionnement :
   * un **header 16 octets** (10×`D3` + **nom sur 6 caractères** issu du nom de fichier, tronqué/paddé),
   * suivi du **flux brut** reçu depuis le X-07.
 
+#### c) Convertir un flux cassette `.cas` / `.k7` en listing texte
+
+Objectif : extraire le programme BASIC tokenisé d’un fichier cassette et le réécrire sous forme de listing `.bas` / `.txt`, sans transfert série.
+
+Côté PC :
+
+1. Dans la section **Cassette stream (.cas/.k7)** :
+
+   * **Select .cas/.k7…**
+   * **Convert to text listing**
+   * choisir le fichier de sortie `.bas` ou `.txt`
+
+Fonctionnement :
+
+* l’outil lit le flux à partir de l’offset **`0x0010`**,
+* il dé-tokenise les lignes BASIC en conservant les numéros de ligne,
+* le listing généré est un listing **lisible/éditable**, pas forcément byte-identique au source d’origine si celui-ci était compacté sans espaces.
+
+#### d) Convertir un listing texte `.txt` / `.bas` en flux cassette tokenisé
+
+Objectif : produire un fichier `.cas` / `.k7` contenant un programme BASIC tokenisé, sans passer par `LOAD"COM:"`.
+
+Côté PC :
+
+1. Dans la section **Text listing (.txt/.bas)** :
+
+   * **Select .txt/.bas…**
+   * **Convert to cassette stream**
+   * choisir le fichier de sortie `.cas` ou `.k7`
+
+Fonctionnement :
+
+* seules les lignes avec **numéro de ligne** sont prises en compte,
+* les mots-clés BASIC sont tokenisés,
+* le fichier généré contient un **header CAS 16 octets** suivi du programme tokenisé.
+
 ---
 
 # ASM (fast loader via COM)
@@ -238,10 +276,7 @@ Permet d’envoyer uniquement le binaire, une fois le loader actif.
 * Le transfert utilise le baud **Loader baud (8N2)**
 * nécessite que le loader soit actif (`RUN`)
 * Aucun délai logiciel n’est utilisé (transfert rapide)
-
-⚠️ Important :
-
-Le script envoie automatiquement un préfixe de synchronisation (primer) pour fiabiliser le transfert.
+* Le binaire est envoyé directement, sans préfixe de synchronisation supplémentaire
 
 ---
 
@@ -349,6 +384,7 @@ It supports:
 
 * **BASIC (text listing)**: sending a `.txt` / `.bas` file by “typing” it line by line
 * **BASIC (cassette raw stream)**: sending *and* receiving `.cas` / `.k7` files via `LOAD"COM:"` and `SAVE"COM:"`
+* **BASIC conversion**: converting a `.txt` / `.bas` listing to a tokenized `.cas` / `.k7` cassette stream, and back again
 * **ASM (fast)**: transferring a loader, then sending a `.bin` binary quickly
 * **Remote keyboard (REMOTE KEYBOARD)**: typing from the PC directly to the X-07
 
@@ -364,7 +400,8 @@ The application provides:
 ### Requirements
 
 * Python 3.10 or newer
-* `pyserial` (automatically installed if needed)
+* `termios` is preferred on macOS when available
+* `pyserial` is still used elsewhere and remains the fallback when needed
 
 ---
 
@@ -537,6 +574,42 @@ Operation:
   * a **16-byte header** (10×`D3` + 6-character name from filename)
   * followed by the **raw received stream**
 
+#### c) Convert a `.cas` / `.k7` cassette stream to a text listing
+
+Goal: extract the tokenized BASIC program from a cassette file and rewrite it as a `.bas` / `.txt` listing, without any serial transfer.
+
+On the PC:
+
+1. In **Cassette stream (.cas/.k7)**:
+
+   * **Select .cas/.k7…**
+   * **Convert to text listing**
+   * choose the output `.bas` or `.txt` file
+
+Operation:
+
+* the tool reads the stream starting at offset **`0x0010`**
+* it de-tokenizes BASIC lines while preserving line numbers
+* the generated listing is meant to be **readable/editable**, so it may not be byte-identical to a tightly packed original source
+
+#### d) Convert a `.txt` / `.bas` text listing to a tokenized cassette stream
+
+Goal: produce a `.cas` / `.k7` file containing a tokenized BASIC program, without using `LOAD"COM:"`.
+
+On the PC:
+
+1. In **Text listing (.txt/.bas)**:
+
+   * **Select .txt/.bas…**
+   * **Convert to cassette stream**
+   * choose the output `.cas` or `.k7` file
+
+Operation:
+
+* only lines with a **line number** are processed
+* BASIC keywords are tokenized
+* the generated file contains a **16-byte CAS header** followed by the tokenized program
+
 ---
 
 # ASM (fast loader via COM)
@@ -579,10 +652,7 @@ Send only the binary once the loader is active.
 * Uses **Loader baud (8N2)**
 * Requires the loader to be running (`RUN`)
 * No software delays (fast transfer)
-
-⚠️ Important:
-
-A synchronization prefix (“primer”) is automatically sent to improve reliability.
+* The binary is now sent directly, without any extra synchronization prefix
 
 ---
 
