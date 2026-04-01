@@ -201,8 +201,20 @@ ROM_TIMER_INIT_15MIN      EQU $E327      ; [DOC] init 15-minute power timer, MOD
 ; 5) SOUND / BUZZER
 ; ============================================================
 
-ROM_BEEP                  EQU $C2DF      ; [OK][DOC] IY=pitch, H=duration, L=0
-ROM_SPK_CONTROL           EQU $C331      ; [DOC] IY=pitch, HL=duration, C=FF on / 00 off
+; Verified in BASIC.ROM with ROM base at $B000:
+; - ROM_BEEP at $C2DF is the callable ASM entry used by local music.z80
+; - ROM_SPK_CONTROL at $C331 is the low-level routine entered by ROM_BEEP
+; - the previous $D2xx/$D3xx hypothesis came from a wrong $C000 base assumption
+; - ROM_BEEP is not called like a normal ROM routine in ASM:
+;     push <continuation address>
+;     IY = note/pitch
+;     H  = duration
+;     L  = 0
+;     call ROM_BEEP
+;   The routine consumes the normal CALL return address and resumes at the
+;   continuation address that was manually pushed beforehand.
+ROM_BEEP                  EQU $C2DF      ; [ROM] ASM entry, special stack convention
+ROM_SPK_CONTROL           EQU $C331      ; [ROM] low-level speaker routine, not meant to be called directly
 
 
 ; ============================================================
@@ -480,7 +492,7 @@ F6R_TXRDY               EQU $01           ; TX ready
 ; [DOC]/[ROM] list (not all validated).
 
 ROM_ABS                EQU $C9DC        ; [DOC]
-ROM_BEEP_BASIC          EQU $C2CD        ; [DOC] BASIC BEEP (wrapper vs ROM_BEEP)
+ROM_BEEP_BASIC          EQU $C2CC        ; [ROM] BASIC BEEP wrapper/parser
 ROM_CINT               EQU $CAE0        ; [DOC]
 ROM_CSNG               EQU $CB08        ; [DOC]
 ROM_CDBL               EQU $CB90        ; [DOC]

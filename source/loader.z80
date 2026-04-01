@@ -1,8 +1,11 @@
     include "canon_x07.inc"
-    .org $1800
+    .org $1f00
 
 start:
     ei
+
+	ld hl,ready_txt
+	call ROM_MSG_DISPLAY_NOSTR
 
     ; Init COM via ROM, dans un slot secondaire
     ld de,DEV_COM_TABLE
@@ -78,6 +81,9 @@ recv_loop:
 
 load_addr:
     .dw 0
+
+ready_txt:
+	.db "READY",0
 
 ; ------------------------------------------------------------
 ; Lit un caractère via ROM_DEV_GETC
