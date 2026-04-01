@@ -1,4 +1,4 @@
-# Canon X-07 Serial Fast Loader (GUI)
+# Canon X-07 Serial Fast Loader (GUI + CLI)
 
 ![Screenshot](./screenshot.png)
 
@@ -7,6 +7,8 @@
 ### Présentation
 
 Cet outil, basé sur une interface graphique **Tkinter**, permet de transférer des programmes vers un **Canon X-07** via une liaison **série**.
+
+Le même script peut aussi être utilisé en **mode console (CLI)** depuis un terminal, sans interface graphique.
 
 Il prend en charge :
 
@@ -67,6 +69,12 @@ Ces résistances permettent de fixer un **état logique stable** lorsque les lig
 
 ```bash
 python x07_loader.pyw
+```
+
+Pour le mode console :
+
+```bash
+python x07_loader.pyw --cli --help
 ```
 
 1. Sélectionner le **port COM** dans *Serial settings*.
@@ -351,6 +359,36 @@ Sécurité :
 
 ---
 
+# Mode console
+
+Le même script peut aussi être utilisé depuis un terminal sans interface graphique.
+
+```bash
+python x07_loader.pyw --cli --help
+```
+
+Commandes principales :
+
+```bash
+python x07_loader.pyw --cli ports
+python x07_loader.pyw --cli convert-basic prog.bas prog.cas
+python x07_loader.pyw --cli convert-cas prog.cas prog.bas
+python x07_loader.pyw --cli send-basic prog.bas --port COM3
+python x07_loader.pyw --cli send-cas prog.cas --port COM3
+python x07_loader.pyw --cli receive-cas dump.cas --port COM3
+python x07_loader.pyw --cli send-loader --port COM3
+python x07_loader.pyw --cli send-bin prog.bin --port COM3
+python x07_loader.pyw --cli send-asm prog.bin --port COM3
+python x07_loader.pyw --cli disable-slave --port COM3
+```
+
+Remarques :
+
+* Le mode GUI reste le comportement par défaut si aucun argument n'est fourni.
+* Le mode console ne propose pas de `REMOTE KEYBOARD` interactif, car les flèches et touches spéciales sont généralement captées par le terminal lui-même sans gestion bas niveau spécifique.
+
+---
+
 # Dépannage
 
 * **Aucun port COM visible** : vérifier le branchement de l’adaptateur, l’installation du pilote, puis cliquer sur **Refresh**.
@@ -379,6 +417,8 @@ Sécurité :
 ### Overview
 
 This tool, based on a **Tkinter GUI**, allows transferring programs to a **Canon X-07** via a **serial connection**.
+
+The same script can also be used in **console mode (CLI)** from a terminal, without the GUI.
 
 It supports:
 
@@ -439,6 +479,12 @@ These resistors ensure a **stable logic level** when the lines are not actively 
 
 ```bash
 python x07_loader.pyw
+```
+
+For console mode:
+
+```bash
+python x07_loader.pyw --cli --help
 ```
 
 1. Select the **COM port** in *Serial settings*.
@@ -726,6 +772,38 @@ Operation:
 Safety:
 
 * disabled automatically during transfers
+
+---
+
+# Console mode / Mode console
+
+The same script can also be used from a terminal without the GUI.
+Le même script peut aussi être utilisé depuis un terminal sans interface graphique.
+
+bash
+python x07_loader.pyw --cli --help
+
+
+Main commands / Commandes principales:
+
+bash
+python x07_loader.pyw --cli ports
+python x07_loader.pyw --cli convert-basic prog.bas prog.cas
+python x07_loader.pyw --cli convert-cas prog.cas prog.bas
+python x07_loader.pyw --cli send-basic prog.bas --port COM3
+python x07_loader.pyw --cli send-cas prog.cas --port COM3
+python x07_loader.pyw --cli receive-cas dump.cas --port COM3
+python x07_loader.pyw --cli send-loader --port COM3
+python x07_loader.pyw --cli send-bin prog.bin --port COM3
+python x07_loader.pyw --cli send-asm prog.bin --port COM3
+python x07_loader.pyw --cli disable-slave --port COM3
+
+
+Notes:
+
+* GUI mode remains the default when no argument is provided.
+* Le mode GUI reste le comportement par défaut si aucun argument n'est fourni.
+* Console mode does not provide an interactive REMOTE KEYBOARD, because arrow keys and special keys are usually handled by the terminal itself unless platform-specific raw console handling is added.
 
 ---
 

@@ -1,3 +1,4 @@
+import argparse
 import configparser
 from pathlib import Path
 import re
@@ -51,13 +52,52 @@ SERIAL_ERRORS = (SerialException, OSError) if HAS_PYSERIAL else (OSError,)
 DEFAULT_CHAR_DELAY_S = 0.04
 DEFAULT_LINE_DELAY_S = 0.20
 DEFAULT_LOAD_ADDR = 0x2000
-DEFAULT_LOADER_ADDR = 0x1800
+DEFAULT_LOADER_ADDR = 0x1F00
 POST_LOADER_EXEC_DELAY_S = 3.0
 LOADER_CAS_NAME = "loader.cas"
 
 BASIC_START = 0x0553
 CAS_FIXED_BASE = 0x0010  # fixed (validated for SEND)
 SAVE_IDLE_TIMEOUT_S = 1.25  # end capture if no bytes for this duration (after any data received)
+
+
+def settings_config_path() -> Path:
+    return Path(__file__).with_suffix(".ini")  # x07_loader.ini
+
+
+def default_serial_settings() -> dict:
+    return {
+        "port": None,
+        "rtscts": False,
+        "typing_baud": 4800,
+        "xfer_baud": 8000,
+        "char_delay": DEFAULT_CHAR_DELAY_S,
+        "line_delay": DEFAULT_LINE_DELAY_S,
+        "loader_addr": hex(DEFAULT_LOADER_ADDR),
+        "asm_addr": hex(DEFAULT_LOAD_ADDR),
+    }
+
+
+def load_saved_serial_settings() -> dict:
+    cfg_path = settings_config_path()
+    settings = default_serial_settings()
+    if not cfg_path.exists():
+        return settings
+
+    cfg = configparser.ConfigParser()
+    try:
+        cfg.read(cfg_path, encoding="utf-8")
+        settings["port"] = cfg.get("serial", "port", fallback="").strip() or None
+        settings["rtscts"] = cfg.getboolean("serial", "rtscts", fallback=False)
+        settings["typing_baud"] = cfg.getint("serial", "typing_baud", fallback=4800)
+        settings["xfer_baud"] = cfg.getint("serial", "xfer_baud", fallback=8000)
+        settings["char_delay"] = cfg.getfloat("serial", "char_delay", fallback=DEFAULT_CHAR_DELAY_S)
+        settings["line_delay"] = cfg.getfloat("serial", "line_delay", fallback=DEFAULT_LINE_DELAY_S)
+        settings["loader_addr"] = cfg.get("serial", "loader_addr", fallback=hex(DEFAULT_LOADER_ADDR))
+        settings["asm_addr"] = cfg.get("serial", "asm_addr", fallback=hex(DEFAULT_LOAD_ADDR))
+    except Exception:
+        pass
+    return settings
 
 
 class SerialPortLike(Protocol):
@@ -1267,7 +1307,11 @@ class X07LoaderApp(tk.Tk):
         row_btns.pack(fill="x", pady=(6, 0))
 
         def kbtn(label: str, cmd, width=6):
-            b = ttk.Button(row_btns, text=label, width=width, command=cmd)
+            def run_and_refocus():
+                cmd()
+                self.after_idle(self._focus_remote_input)
+
+            b = ttk.Button(row_btns, text=label, width=width, command=run_and_refocus)
             b.pack(side="left", padx=(2, 0))
             self._kbd_controls.append(b)
             return b
@@ -1278,37 +1322,10 @@ class X07LoaderApp(tk.Tk):
         kbtn("DEL",   lambda: self._kbd_send_byte(KEY_DEL), width=5)
         kbtn("BREAK", lambda: self._kbd_send_byte(KEY_ON_BREAK), width=6)
 
-        ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
-
-        def macro(label: str, text: str, w=7):
-            b = ttk.Button(
-                row_btns,
-                text=label,
-                width=w,
-                command=lambda: self._kbd_send_bytes(x07_encode_text(text)),
-            )
-            b.pack(side="left", padx=(2, 0))
-            self._kbd_controls.append(b)
-
-        macro("?TIME$",  "?TIME$\r")
-        macro("?DATE$",  "?DATE$\r")
-        macro("CLOAD",   'CLOAD"\r')
-        macro("CSAVE",   'CSAVE"\r')
-        macro("LOCATE",  "LOCATE ")
-        macro("PRINT",   "PRINT ")
-        macro("LIST",    "LIST ")
-        macro("RUN",     "RUN\r")
-        macro("SLEEP",   "SLEEP")
-        macro("CONT",    "CONT\r")
-
-        ttk.Separator(row_btns, orient="vertical").pack(side="left", fill="y", padx=8)
-
-        kbtn("←", lambda: self._kbd_send_byte(KEY_LEFT), width=3)
-        kbtn("↑", lambda: self._kbd_send_byte(KEY_UP), width=3)
-        kbtn("↓", lambda: self._kbd_send_byte(KEY_DOWN), width=3)
-        kbtn("→", lambda: self._kbd_send_byte(KEY_RIGHT), width=3)
-
-        ttk.Label(kbd, text="Type here (sent to X-07 while REMOTE KEYBOARD is ON):").pack(anchor="w", pady=(6, 0))
+        ttk.Label(
+            kbd,
+            text="Type here (sent to X-07 while REMOTE KEYBOARD is ON):",
+        ).pack(anchor="w", pady=(6, 0))
         self.relay_box = tk.Text(kbd, height=1, wrap="none")
         self.relay_box.pack(fill="x", expand=False)
         self.relay_box.bind("<KeyPress>", self._on_remote_keypress)
@@ -1380,37 +1397,10 @@ class X07LoaderApp(tk.Tk):
 
     # ---------------- Ports ----------------
     def _config_path(self) -> Path:
-        return Path(__file__).with_suffix(".ini")  # x07_loader.ini
+        return settings_config_path()
 
     def _load_serial_settings(self) -> dict:
-        cfg_path = self._config_path()
-        settings = {
-            "port": None,
-            "rtscts": False,
-            "typing_baud": 4800,
-            "xfer_baud": 8000,
-            "char_delay": DEFAULT_CHAR_DELAY_S,
-            "line_delay": DEFAULT_LINE_DELAY_S,
-            "loader_addr": hex(DEFAULT_LOADER_ADDR),
-            "asm_addr": hex(DEFAULT_LOAD_ADDR),
-        }
-        if not cfg_path.exists():
-            return settings
-
-        cfg = configparser.ConfigParser()
-        try:
-            cfg.read(cfg_path, encoding="utf-8")
-            settings["port"] = cfg.get("serial", "port", fallback="").strip() or None
-            settings["rtscts"] = cfg.getboolean("serial", "rtscts", fallback=False)
-            settings["typing_baud"] = cfg.getint("serial", "typing_baud", fallback=4800)
-            settings["xfer_baud"] = cfg.getint("serial", "xfer_baud", fallback=8000)
-            settings["char_delay"] = cfg.getfloat("serial", "char_delay", fallback=DEFAULT_CHAR_DELAY_S)
-            settings["line_delay"] = cfg.getfloat("serial", "line_delay", fallback=DEFAULT_LINE_DELAY_S)
-            settings["loader_addr"] = cfg.get("serial", "loader_addr", fallback=hex(DEFAULT_LOADER_ADDR))
-            settings["asm_addr"] = cfg.get("serial", "asm_addr", fallback=hex(DEFAULT_LOAD_ADDR))
-        except Exception:
-            pass
-        return settings
+        return load_saved_serial_settings()
 
     def _save_serial_settings(self) -> None:
         cfg_path = self._config_path()
@@ -1638,15 +1628,32 @@ class X07LoaderApp(tk.Tk):
         if not lines:
             raise RuntimeError("Unexpected loader.cas format: no BASIC payload lines found.")
 
-        def _patch_ascii_field(line_no: int, repl_values):
-            line = next((ln for ln in lines if ln["line_no"] == line_no), None)
-            if line is None:
-                raise RuntimeError(f"Unexpected loader.cas format: BASIC line {line_no} not found.")
-            content = bytes(payload[line["content_start"]:line["content_end"]])
+        def _line_content(line) -> bytes:
+            return bytes(payload[line["content_start"]:line["content_end"]])
+
+        def _find_loader_line(token: int, min_fields: int, label: str):
+            matches = []
+            for ln in lines:
+                content = _line_content(ln)
+                if not content or content[0] != token:
+                    continue
+                fields = list(re.finditer(rb"&H[0-9A-F]{4}", content))
+                if len(fields) >= min_fields:
+                    matches.append(ln)
+            if len(matches) != 1:
+                found = [ln["line_no"] for ln in matches]
+                raise RuntimeError(
+                    f"Unexpected loader.cas format: could not uniquely identify {label} line "
+                    f"(matches={found or 'none'})."
+                )
+            return matches[0]
+
+        def _patch_ascii_field(line, repl_values, label: str):
+            content = _line_content(line)
             fields = list(re.finditer(rb"&H[0-9A-F]{4}", content))
             if len(fields) < len(repl_values):
                 raise RuntimeError(
-                    f"Unexpected loader.cas format: BASIC line {line_no} has only {len(fields)} address field(s)."
+                    f"Unexpected loader.cas format: {label} line has only {len(fields)} address field(s)."
                 )
             patched = bytearray(content)
             for m, repl in zip(fields, repl_values):
@@ -1655,7 +1662,11 @@ class X07LoaderApp(tk.Tk):
                 patched[m.start():m.end()] = repl
             payload[line["content_start"]:line["content_end"]] = patched
 
-        data_lines = [ln for ln in lines if ln["line_no"] >= 5]
+        clear_line = _find_loader_line(0xA3, 1, "CLEAR")
+        for_line = _find_loader_line(0x81, 2, "FOR")
+        exec_line = _find_loader_line(0xA8, 1, "EXEC")
+
+        data_lines = [ln for ln in lines if _line_content(ln)[:1] == b"\x83"]
         if not data_lines:
             raise RuntimeError("Unexpected loader.cas format: DATA lines not found.")
 
@@ -1675,41 +1686,50 @@ class X07LoaderApp(tk.Tk):
         if loader_byte_count <= 0:
             raise RuntimeError("Unexpected loader.cas format: no DATA bytes found.")
 
+        def _extract_first_ascii_addr(line, label: str) -> int:
+            content = _line_content(line)
+            m = re.search(rb"&H([0-9A-F]{4})", content)
+            if m is None:
+                raise RuntimeError(f"Unexpected loader.cas format: {label} line has no &Hxxxx address field.")
+            return int(m.group(1), 16)
+
+        orig_base = _extract_first_ascii_addr(clear_line, "CLEAR")
+        orig_end_addr = orig_base + loader_byte_count - 1
+        if orig_end_addr > 0xFFFF:
+            raise RuntimeError("Unexpected loader.cas format: loader image exceeds 16-bit address space.")
+
         end_addr = (load_addr + loader_byte_count - 1) & 0xFFFF
 
-        _patch_ascii_field(1, [f"&H{load_addr:04X}".encode("ascii")])  # CLEAR
-        _patch_ascii_field(2, [f"&H{load_addr:04X}".encode("ascii"), f"&H{end_addr:04X}".encode("ascii")])  # FOR
-        _patch_ascii_field(4, [f"&H{load_addr:04X}".encode("ascii")])  # EXEC
+        _patch_ascii_field(clear_line, [f"&H{load_addr:04X}".encode("ascii")], "CLEAR")
+        _patch_ascii_field(
+            for_line,
+            [f"&H{load_addr:04X}".encode("ascii"), f"&H{end_addr:04X}".encode("ascii")],
+            "FOR",
+        )
+        _patch_ascii_field(exec_line, [f"&H{load_addr:04X}".encode("ascii")], "EXEC")
 
-        orig_base = 0x1800
-        internal_offsets = {
-            "load_addr": 0x53,
-            "get_char_filtered": 0x55,
-            "read_hex_nibble": 0x6D,
-            "read_hex8": 0x95,
-            "read_hex16": 0xAB,
-        }
+        def _is_loader_address(addr: int) -> bool:
+            return orig_base <= addr <= orig_end_addr
 
-        def patch_word_sequences(opcode: int, old_addr: int, new_addr: int) -> int:
-            old_seq = bytes([opcode, old_addr & 0xFF, (old_addr >> 8) & 0xFF])
-            new_seq = bytes([opcode, new_addr & 0xFF, (new_addr >> 8) & 0xFF])
-            idx = 0
+        def relocate_absolute_operands(opcodes: set[int], *, skip_indexed_loads: bool = False) -> int:
             count = 0
-            while True:
-                idx = loader_bytes.find(old_seq, idx)
-                if idx < 0:
-                    break
-                loader_bytes[idx:idx + 3] = new_seq
-                idx += 3
+            for idx in range(len(loader_bytes) - 2):
+                opcode = loader_bytes[idx]
+                if opcode not in opcodes:
+                    continue
+                if skip_indexed_loads and idx > 0 and loader_bytes[idx - 1] in (0xDD, 0xFD):
+                    continue
+                addr = loader_bytes[idx + 1] | (loader_bytes[idx + 2] << 8)
+                if not _is_loader_address(addr):
+                    continue
+                relocated = (load_addr + (addr - orig_base)) & 0xFFFF
+                loader_bytes[idx + 1] = relocated & 0xFF
+                loader_bytes[idx + 2] = (relocated >> 8) & 0xFF
                 count += 1
             return count
 
-        patch_word_sequences(0x22, orig_base + internal_offsets["load_addr"], load_addr + internal_offsets["load_addr"])
-        patch_word_sequences(0x2A, orig_base + internal_offsets["load_addr"], load_addr + internal_offsets["load_addr"])
-        patch_word_sequences(0xCD, orig_base + internal_offsets["get_char_filtered"], load_addr + internal_offsets["get_char_filtered"])
-        patch_word_sequences(0xCD, orig_base + internal_offsets["read_hex_nibble"], load_addr + internal_offsets["read_hex_nibble"])
-        patch_word_sequences(0xCD, orig_base + internal_offsets["read_hex8"], load_addr + internal_offsets["read_hex8"])
-        patch_word_sequences(0xCD, orig_base + internal_offsets["read_hex16"], load_addr + internal_offsets["read_hex16"])
+        relocate_absolute_operands({0x22, 0x2A, 0x32, 0x3A, 0xCD, 0xC3})
+        relocate_absolute_operands({0x01, 0x11, 0x21, 0x31}, skip_indexed_loads=True)
 
         baud = int(self.var_xfer_baud.get()) & 0xFFFF
         baud_pattern = bytes([0xDD, 0x21, 0x40, 0x1F])  # template uses 8000 baud
@@ -2271,6 +2291,8 @@ class X07LoaderApp(tk.Tk):
             f"{self._serial_backend_name(self.remote_ser)})."
         )
         self.log('[INFO] Remote keyboard requires SLAVE mode (INIT#5,"COM:" then EXEC&HEE1F).')
+        self.log("[INFO] PC arrow keys are sent when the remote input box has focus.")
+        self.after_idle(self._focus_remote_input)
 
     def _remote_keyboard_off(self, reason: str = "[OK] REMOTE KEYBOARD: OFF"):
         try:
@@ -2283,6 +2305,14 @@ class X07LoaderApp(tk.Tk):
         self.btn_remote_toggle.config(text="REMOTE KEYBOARD: OFF")
         self._set_keyboard_controls_enabled(False)
         self.log(reason)
+
+    def _focus_remote_input(self):
+        if not self.remote_kbd_on:
+            return
+        try:
+            self.relay_box.focus_set()
+        except Exception:
+            pass
 
     def _kbd_send_byte(self, b: int):
         if not self.remote_kbd_on or not self.remote_ser:
@@ -2350,6 +2380,305 @@ class X07LoaderApp(tk.Tk):
         return "break"
 
 
+class SimpleVar:
+    def __init__(self, value):
+        self._value = value
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        self._value = value
+
+
+class X07CliRunner:
+    _require_port = X07LoaderApp._require_port
+    _serial_backend_name = X07LoaderApp._serial_backend_name
+    _open_serial = X07LoaderApp._open_serial
+    _open_for_typing = X07LoaderApp._open_for_typing
+    _open_for_raw = X07LoaderApp._open_for_raw
+    _prepare_raw_transfer = X07LoaderApp._prepare_raw_transfer
+    _parse_addr = X07LoaderApp._parse_addr
+    _parse_loader_addr = X07LoaderApp._parse_loader_addr
+    _loader_cas_path = X07LoaderApp._loader_cas_path
+    _build_loader_cas_payload = X07LoaderApp._build_loader_cas_payload
+    _build_loader_ascii_frame = X07LoaderApp._build_loader_ascii_frame
+    _send_loader_cas_raw = X07LoaderApp._send_loader_cas_raw
+    _send_loader_cas_remote = X07LoaderApp._send_loader_cas_remote
+    _type_line = X07LoaderApp._type_line
+    _tcdrain = X07LoaderApp._tcdrain
+    _stream_raw_payload = X07LoaderApp._stream_raw_payload
+    _send_ascii_frame = X07LoaderApp._send_ascii_frame
+    _build_current_asm_frame = X07LoaderApp._build_current_asm_frame
+    _send_current_asm_frame = X07LoaderApp._send_current_asm_frame
+    _convert_basic_to_cas_impl = X07LoaderApp._convert_basic_to_cas_impl
+    _convert_cas_to_text_impl = X07LoaderApp._convert_cas_to_text_impl
+    _disable_slave_mode_impl = X07LoaderApp._disable_slave_mode_impl
+    _send_basic_file_impl = X07LoaderApp._send_basic_file_impl
+    _send_fast_loader_impl = X07LoaderApp._send_fast_loader_impl
+    _send_bin_only_impl = X07LoaderApp._send_bin_only_impl
+    _send_loader_and_bin_impl = X07LoaderApp._send_loader_and_bin_impl
+    _send_cas_raw_impl = X07LoaderApp._send_cas_raw_impl
+    _receive_cas_raw_impl = X07LoaderApp._receive_cas_raw_impl
+
+    def __init__(self, args):
+        settings = load_saved_serial_settings()
+
+        self.cancel_event = threading.Event()
+        self.basic_file = getattr(args, "input", None)
+        self.bin_file = getattr(args, "input", None)
+        self.cas_file = getattr(args, "input", None)
+
+        self.var_port = SimpleVar(getattr(args, "port", None) or settings.get("port") or "")
+        self.var_rtscts = SimpleVar(bool(getattr(args, "rtscts", settings.get("rtscts", False))))
+        self.var_typing_baud = SimpleVar(int(getattr(args, "typing_baud", settings.get("typing_baud", 4800))))
+        self.var_xfer_baud = SimpleVar(int(getattr(args, "xfer_baud", settings.get("xfer_baud", 8000))))
+        self.var_char = SimpleVar(float(getattr(args, "char_delay", settings.get("char_delay", DEFAULT_CHAR_DELAY_S))))
+        self.var_line = SimpleVar(float(getattr(args, "line_delay", settings.get("line_delay", DEFAULT_LINE_DELAY_S))))
+        self.var_loader_addr = SimpleVar(str(getattr(args, "loader_addr", settings.get("loader_addr", hex(DEFAULT_LOADER_ADDR)))))
+        self.var_addr = SimpleVar(str(getattr(args, "asm_addr", settings.get("asm_addr", hex(DEFAULT_LOAD_ADDR)))))
+
+        self._last_status: str | None = None
+        self._last_progress_bucket: int | None = None
+
+    def _ts(self) -> str:
+        return time.strftime("[%H:%M:%S]")
+
+    def log(self, msg: str):
+        print(f"{self._ts()} {msg}", flush=True)
+
+    def _set_status(self, text: str):
+        if text != self._last_status:
+            self._last_status = text
+            self.log(f"[STATUS] {text}")
+
+    def _set_progress(self, pct: float, label: str):
+        pct = max(0.0, min(100.0, float(pct)))
+        if pct >= 100.0:
+            bucket = 10
+        else:
+            bucket = int(pct // 10)
+        if bucket == self._last_progress_bucket and pct not in (0.0, 100.0):
+            return
+        self._last_progress_bucket = bucket
+        if pct <= 0.0:
+            self.log(f"[PROGRESS] {label}")
+        elif pct >= 100.0:
+            self.log(f"[PROGRESS] 100% - {label}")
+        else:
+            self.log(f"[PROGRESS] {pct:.0f}% - {label}")
+
+    def inspect_cas_header_cli(self):
+        if not self.cas_file or not self.cas_file.exists():
+            raise RuntimeError("Select a .cas/.k7 file first.")
+        data = self.cas_file.read_bytes()
+        name = guess_name_in_first_16_bytes(data, self.cas_file.stem)
+
+        self.log("[INFO] Inspect header:")
+        self.log(f"       File: {self.cas_file.name}")
+        self.log(f"       Name guess: {name}")
+        self.log("       Preview @0x0000:")
+
+        chunk = data[:96]
+        hexline = " ".join(f"{b:02X}" for b in chunk[:64])
+        asciiline = "".join(chr(b) if 0x20 <= b <= 0x7E else "." for b in chunk[:64])
+        self.log(f"       0x0000: {hexline}")
+        self.log(f"               {asciiline}")
+
+    def run(self, name: str, fn) -> int:
+        try:
+            self.log(f"--- {name} ---")
+            fn()
+            self._set_status("done")
+            return 0
+        except KeyboardInterrupt:
+            self.cancel_event.set()
+            self.log(f"[WARN] {name} cancelled by user.")
+            return 130
+        except InterruptedError as e:
+            self.log(f"[WARN] {name} cancelled: {e}")
+            return 130
+        except Exception as e:
+            self.log(f"[ERROR] {name}: {e!r}")
+            return 1
+
+
+def _add_port_arg(parser, settings: dict):
+    parser.add_argument(
+        "--port",
+        default=settings.get("port") or "",
+        help='Serial port to use (default: last saved port from x07_loader.ini, if any).',
+    )
+
+
+def _add_rtscts_args(parser, settings: dict):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--rtscts", dest="rtscts", action="store_true", help="Use RTS/CTS hardware flow control.")
+    group.add_argument("--no-rtscts", dest="rtscts", action="store_false", help="Disable RTS/CTS hardware flow control.")
+    parser.set_defaults(rtscts=bool(settings.get("rtscts", False)))
+
+
+def _add_typing_args(parser, settings: dict, *, include_delays: bool = False):
+    _add_port_arg(parser, settings)
+    _add_rtscts_args(parser, settings)
+    parser.add_argument(
+        "--typing-baud",
+        type=int,
+        default=int(settings.get("typing_baud", 4800)),
+        help="Baud rate for text/CAS transfers in 8N2 mode.",
+    )
+    if include_delays:
+        parser.add_argument(
+            "--char-delay",
+            type=float,
+            default=float(settings.get("char_delay", DEFAULT_CHAR_DELAY_S)),
+            help="Delay in seconds between typed characters.",
+        )
+        parser.add_argument(
+            "--line-delay",
+            type=float,
+            default=float(settings.get("line_delay", DEFAULT_LINE_DELAY_S)),
+            help="Delay in seconds after each typed line.",
+        )
+
+
+def _add_loader_runtime_args(parser, settings: dict, *, include_loader_addr: bool = False, include_asm_addr: bool = False):
+    parser.add_argument(
+        "--xfer-baud",
+        type=int,
+        default=int(settings.get("xfer_baud", 8000)),
+        help="Loader/runtime baud rate for ASM transfers in 8N2 mode.",
+    )
+    if include_loader_addr:
+        parser.add_argument(
+            "--loader-addr",
+            default=str(settings.get("loader_addr", hex(DEFAULT_LOADER_ADDR))),
+            help="Loader address (for example 0x1F00 or 1F00h).",
+        )
+    if include_asm_addr:
+        parser.add_argument(
+            "--asm-addr",
+            default=str(settings.get("asm_addr", hex(DEFAULT_LOAD_ADDR))),
+            help="ASM load address (for example 0x2000 or 2000h).",
+        )
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    settings = load_saved_serial_settings()
+    parser = argparse.ArgumentParser(
+        description="Canon X-07 Serial Fast Loader CLI. Run without arguments to start the GUI.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("gui", help="Start the graphical interface.")
+    subparsers.add_parser("ports", help="List available serial ports.")
+
+    p = subparsers.add_parser("inspect-cas", help="Inspect the header of a .cas/.k7 file.")
+    p.add_argument("input", type=Path, help="Input .cas/.k7 file.")
+
+    p = subparsers.add_parser("convert-basic", help="Convert a BASIC .txt/.bas listing to a tokenized .cas/.k7 file.")
+    p.add_argument("input", type=Path, help="Input BASIC .txt/.bas file.")
+    p.add_argument("output", type=Path, help="Output .cas/.k7 file.")
+
+    p = subparsers.add_parser("convert-cas", help="Convert a tokenized .cas/.k7 file to a BASIC text listing.")
+    p.add_argument("input", type=Path, help="Input .cas/.k7 file.")
+    p.add_argument("output", type=Path, help="Output .bas/.txt file.")
+
+    p = subparsers.add_parser("disable-slave", help='Send EXEC&HEE33 to leave SLAVE mode.')
+    _add_typing_args(p, settings, include_delays=True)
+
+    p = subparsers.add_parser("send-basic", help="Send a BASIC .txt/.bas listing through SLAVE mode.")
+    p.add_argument("input", type=Path, help="Input BASIC .txt/.bas file.")
+    _add_typing_args(p, settings, include_delays=True)
+
+    p = subparsers.add_parser("send-cas", help='Send a .cas/.k7 raw cassette stream (X-07 side: LOAD"COM:").')
+    p.add_argument("input", type=Path, help="Input .cas/.k7 file.")
+    _add_typing_args(p, settings, include_delays=False)
+
+    p = subparsers.add_parser("receive-cas", help='Receive a .cas file from the X-07 (X-07 side: SAVE"COM:").')
+    p.add_argument("output", type=Path, help="Output .cas file.")
+    _add_typing_args(p, settings, include_delays=False)
+
+    p = subparsers.add_parser("send-loader", help='Send loader.cas only (X-07 side: LOAD"COM:").')
+    _add_typing_args(p, settings, include_delays=False)
+    _add_loader_runtime_args(p, settings, include_loader_addr=True, include_asm_addr=False)
+
+    p = subparsers.add_parser("send-bin", help="Send an ASM .bin file through the already running loader.")
+    p.add_argument("input", type=Path, help="Input ASM .bin file.")
+    _add_port_arg(p, settings)
+    _add_rtscts_args(p, settings)
+    _add_loader_runtime_args(p, settings, include_loader_addr=False, include_asm_addr=True)
+
+    p = subparsers.add_parser("send-asm", help='One-click ASM transfer: send loader.cas, then the ASM .bin file (SLAVE mode required).')
+    p.add_argument("input", type=Path, help="Input ASM .bin file.")
+    _add_typing_args(p, settings, include_delays=True)
+    _add_loader_runtime_args(p, settings, include_loader_addr=True, include_asm_addr=True)
+
+    return parser
+
+
+def run_cli(args) -> int:
+    if args.command == "gui":
+        app = X07LoaderApp()
+        app.mainloop()
+        return 0
+
+    if args.command == "ports":
+        ports = list_serial_ports()
+        if not ports:
+            print("No serial port found.", flush=True)
+            return 1
+        for port in ports:
+            print(port, flush=True)
+        return 0
+
+    runner = X07CliRunner(args)
+
+    if args.command == "inspect-cas":
+        return runner.run("Inspect CAS/K7 header", runner.inspect_cas_header_cli)
+    if args.command == "convert-basic":
+        return runner.run("Convert BASIC to cassette stream", lambda: runner._convert_basic_to_cas_impl(args.output))
+    if args.command == "convert-cas":
+        return runner.run("Convert cassette stream to text listing", lambda: runner._convert_cas_to_text_impl(args.output))
+    if args.command == "disable-slave":
+        return runner.run("Disable SLAVE mode (EXEC&HEE33)", runner._disable_slave_mode_impl)
+    if args.command == "send-basic":
+        return runner.run("Send BASIC (.txt/.bas)", runner._send_basic_file_impl)
+    if args.command == "send-cas":
+        return runner.run('Send CAS/K7 raw stream (LOAD"COM:")', runner._send_cas_raw_impl)
+    if args.command == "receive-cas":
+        return runner.run('Receive CAS/K7 raw stream (SAVE"COM:")', lambda: runner._receive_cas_raw_impl(args.output))
+    if args.command == "send-loader":
+        return runner.run('Send ASM loader (LOAD"COM:")', runner._send_fast_loader_impl)
+    if args.command == "send-bin":
+        return runner.run("Send ASM (loader running)", runner._send_bin_only_impl)
+    if args.command == "send-asm":
+        return runner.run("One click: loader + ASM", runner._send_loader_and_bin_impl)
+
+    raise RuntimeError(f"Unknown command: {args.command}")
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    force_cli = False
+    if argv and argv[0] == "--cli":
+        force_cli = True
+        argv = argv[1:]
+
+    parser = build_cli_parser()
+
+    if not argv and not force_cli:
+        app = X07LoaderApp()
+        app.mainloop()
+        return 0
+
+    if not argv and force_cli:
+        parser.print_help()
+        return 0
+
+    args = parser.parse_args(argv)
+    return run_cli(args)
+
+
 if __name__ == "__main__":
-    app = X07LoaderApp()
-    app.mainloop()
+    raise SystemExit(main())
