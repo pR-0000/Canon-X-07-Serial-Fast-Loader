@@ -255,22 +255,6 @@ Principe :
 3. Le PC envoie ensuite le binaire sous forme ASCII hex.
 4. Le loader copie les données en mémoire puis exécute automatiquement le programme.
 
-Avec une seule puce d’extension **8 Ko** utilisée comme RAM continue en `2000h-3FFFh`, la zone totale disponible pour le programme machine est de **8192 octets**.
-
-Le loader réserve désormais un `RAM file` minimal avec :
-
-```basic
-FSET 13
-```
-
-Cela laisse une **limite théorique maximale de 8179 octets** pour le binaire chargé à partir de `&H2000` :
-
-```text
-8192 - 13 = 8179
-```
-
-En pratique, il reste conseillé de garder une petite marge sous cette limite si le programme doit rester robuste après un cycle `OFF/ON`.
-
 ---
 
 ## Méthodes
@@ -290,8 +274,6 @@ Puis sur PC :
 * cliquer sur **Send ASM loader**
 
 Le loader est transféré comme un flux cassette (raw).
-
-Le loader BASIC fourni inclut maintenant `FSET 13` avant le `CLEAR`, afin de réserver automatiquement le plus petit `RAM file` possible sans sacrifier inutilement d’espace pour le programme machine.
 
 ---
 
@@ -687,22 +669,6 @@ Principle:
 3. The PC sends the binary as ASCII hex
 4. The loader copies the data into memory and executes the program
 
-With a single **8 KB** expansion RAM chip used as continuous RAM in `2000h-3FFFh`, the total space available for the machine-code program is **8192 bytes**.
-
-The loader now reserves a minimal `RAM file` with:
-
-```basic
-FSET 13
-```
-
-This leaves a **theoretical maximum size of 8179 bytes** for a binary loaded at `&H2000`:
-
-```text
-8192 - 13 = 8179
-```
-
-In practice, it is still wise to keep a small safety margin below that limit if the program must remain reliable after an `OFF/ON` cycle.
-
 ---
 
 ## Methods
@@ -722,8 +688,6 @@ Then on PC:
 * click **Send ASM loader**
 
 The loader is transferred as a raw cassette stream.
-
-The bundled BASIC loader now includes `FSET 13` before `CLEAR`, so it automatically reserves the smallest practical `RAM file` without wasting unnecessary space from the machine-code area.
 
 ---
 
