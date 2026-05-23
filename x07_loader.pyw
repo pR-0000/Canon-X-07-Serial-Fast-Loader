@@ -999,21 +999,91 @@ def detokenize_basic_payload(payload: bytes) -> str:
     return "\n".join(f"{line_number} {_detokenize_basic_body(content)}" for line_number, content in lines)
 
 
-def list_serial_ports():
+def trim_leading_basic_junk(payload: bytes, max_skip: int = 32) -> tuple[bytes, int]:
+    """Trim a few leading stray bytes if a valid tokenized BASIC payload starts shortly after."""
+    if not payload:
+        return payload, 0
+
+    try:
+        parse_tokenized_basic_payload(payload)
+        return payload, 0
+    except Exception:
+        pass
+
+    limit = min(max_skip, max(0, len(payload) - 4))
+    for skip in range(1, limit + 1):
+        candidate = payload[skip:]
+        try:
+            parse_tokenized_basic_payload(candidate)
+            return candidate, skip
+        except Exception:
+            continue
+
+    return payload, 0
+
+
+def _format_serial_port_label(port_info) -> str:
+    device = str(getattr(port_info, "device", "") or "").strip()
+    parts = []
+
+    description = str(getattr(port_info, "description", "") or "").strip()
+    if description and description.lower() not in {"n/a", device.lower()}:
+        parts.append(description)
+
+    product = str(getattr(port_info, "product", "") or "").strip()
+    if product and product.lower() not in {device.lower(), description.lower()}:
+        parts.append(product)
+
+    manufacturer = str(getattr(port_info, "manufacturer", "") or "").strip()
+    existing_lower = {p.lower() for p in parts}
+    if manufacturer and manufacturer.lower() not in existing_lower and manufacturer.lower() != device.lower():
+        parts.append(manufacturer)
+
+    vid = getattr(port_info, "vid", None)
+    pid = getattr(port_info, "pid", None)
+    if vid is not None and pid is not None:
+        parts.append(f"{int(vid):04X}:{int(pid):04X}")
+
+    extras = " | ".join(parts[:3])
+    return f"{device} - {extras}" if extras else device
+
+
+def list_serial_port_entries() -> list[tuple[str, str]]:
+    if HAS_PYSERIAL:
+        infos = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
+        if IS_MACOS:
+            cu_infos = [p for p in infos if str(getattr(p, "device", "")).startswith("/dev/cu.")]
+            if cu_infos:
+                infos = cu_infos
+
+        used_labels: set[str] = set()
+        entries: list[tuple[str, str]] = []
+        for info in infos:
+            device = str(getattr(info, "device", "") or "").strip()
+            if not device:
+                continue
+            label = _format_serial_port_label(info)
+            if label in used_labels:
+                hwid = str(getattr(info, "hwid", "") or "").strip()
+                if hwid:
+                    label = f"{label} [{hwid}]"
+                else:
+                    label = f"{label} [{device}]"
+            used_labels.add(label)
+            entries.append((device, label))
+        if entries:
+            return entries
+
     if IS_MACOS and DARWIN_TERMIOS_AVAILABLE:
         ports = sorted(str(p) for p in Path("/dev").glob("cu.*"))
         if ports:
-            return ports
-
-    if HAS_PYSERIAL:
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        if IS_MACOS:
-            cu_ports = [p for p in ports if p.startswith("/dev/cu.")]
-            if cu_ports:
-                return cu_ports
-        return ports
+            return [(p, p) for p in ports]
 
     return []
+
+
+def list_serial_ports():
+    return [device for device, _label in list_serial_port_entries()]
 
 
 def guess_name_in_first_16_bytes(data: bytes, fallback: str) -> str:
@@ -1118,6 +1188,8 @@ class X07LoaderApp(tk.Tk):
         self._transfer_controls: list[ttk.Widget] = []
         self._always_enabled_controls: list[ttk.Widget] = []
         self._kbd_controls: list[ttk.Widget] = []  # enabled only when REMOTE KEYBOARD ON
+        self._port_label_to_device: dict[str, str] = {}
+        self._port_device_to_label: dict[str, str] = {}
 
         self._build_ui()
         self.refresh_ports(initial=True)
@@ -1138,6 +1210,7 @@ class X07LoaderApp(tk.Tk):
 
         self.var_port = tk.StringVar(value="")
         self.var_port.trace_add("write", lambda *_: self._save_serial_settings())
+        self.var_port_display = tk.StringVar(value="")
         self.var_typing_baud = tk.IntVar(value=4800)   # 8N2
         self.var_xfer_baud = tk.IntVar(value=8000)     # 8N2 loader/runtime
 
@@ -1155,8 +1228,9 @@ class X07LoaderApp(tk.Tk):
         r.pack(fill="x")
 
         ttk.Label(r, text="COM:").pack(side="left")
-        self.cbo_port = ttk.Combobox(r, textvariable=self.var_port, width=10, state="readonly")
+        self.cbo_port = ttk.Combobox(r, textvariable=self.var_port_display, width=64, state="readonly")
         self.cbo_port.pack(side="left", padx=(4, 6))
+        self.cbo_port.bind("<<ComboboxSelected>>", self._on_port_selected)
 
         btn_refresh = ttk.Button(r, text="Refresh", command=self.refresh_ports)
         btn_refresh.pack(side="left", padx=(0, 10))
@@ -1176,16 +1250,6 @@ class X07LoaderApp(tk.Tk):
         )
         self.chk_rtscts.pack(side="left", padx=(10, 10))
 
-        self.lbl_char = ttk.Label(r, text="CHAR(s):")
-        self.lbl_char.pack(side="left")
-        self.ent_char = ttk.Entry(r, textvariable=self.var_char, width=6)
-        self.ent_char.pack(side="left", padx=(3, 8))
-
-        self.lbl_line = ttk.Label(r, text="LINE(s):")
-        self.lbl_line.pack(side="left")
-        self.ent_line = ttk.Entry(r, textvariable=self.var_line, width=6)
-        self.ent_line.pack(side="left", padx=(3, 8))
-
 
         # cancel/disable slave row
         r2 = ttk.Frame(serial_box)
@@ -1196,6 +1260,16 @@ class X07LoaderApp(tk.Tk):
         btn_disable_slave = ttk.Button(r2, text="Disable slave (EXEC&HEE33)", command=self.disable_slave_mode)
         btn_disable_slave.pack(side="left", padx=(6, 0))
         self._transfer_controls.append(btn_disable_slave)
+
+        self.lbl_char = ttk.Label(r2, text="CHAR(s):")
+        self.lbl_char.pack(side="left", padx=(16, 0))
+        self.ent_char = ttk.Entry(r2, textvariable=self.var_char, width=6)
+        self.ent_char.pack(side="left", padx=(3, 8))
+
+        self.lbl_line = ttk.Label(r2, text="LINE(s):")
+        self.lbl_line.pack(side="left")
+        self.ent_line = ttk.Entry(r2, textvariable=self.var_line, width=6)
+        self.ent_line.pack(side="left", padx=(3, 8))
 
         # ---- BASIC ----
         basic_box = ttk.LabelFrame(main, text="BASIC", padding=6)
@@ -1302,16 +1376,14 @@ class X07LoaderApp(tk.Tk):
         self.btn_remote_toggle = ttk.Button(rk, text="REMOTE KEYBOARD: OFF", command=self.toggle_remote_keyboard)
         self.btn_remote_toggle.pack(side="left")
         self._always_enabled_controls.append(self.btn_remote_toggle)
-
-        row_btns = ttk.Frame(kbd)
-        row_btns.pack(fill="x", pady=(6, 0))
+        ttk.Separator(rk, orient="vertical").pack(side="left", fill="y", padx=8)
 
         def kbtn(label: str, cmd, width=6):
             def run_and_refocus():
                 cmd()
                 self.after_idle(self._focus_remote_input)
 
-            b = ttk.Button(row_btns, text=label, width=width, command=run_and_refocus)
+            b = ttk.Button(rk, text=label, width=width, command=run_and_refocus)
             b.pack(side="left", padx=(2, 0))
             self._kbd_controls.append(b)
             return b
@@ -1325,7 +1397,7 @@ class X07LoaderApp(tk.Tk):
         ttk.Label(
             kbd,
             text="Type here (sent to X-07 while REMOTE KEYBOARD is ON):",
-        ).pack(anchor="w", pady=(6, 0))
+        ).pack(anchor="w", pady=(4, 0))
         self.relay_box = tk.Text(kbd, height=1, wrap="none")
         self.relay_box.pack(fill="x", expand=False)
         self.relay_box.bind("<KeyPress>", self._on_remote_keypress)
@@ -1422,9 +1494,22 @@ class X07LoaderApp(tk.Tk):
         except Exception:
             pass
 
+    def _on_port_selected(self, _event=None):
+        label = (self.var_port_display.get() or "").strip()
+        device = self._port_label_to_device.get(label, label)
+        self.var_port.set(device)
+
+    def _set_port_display(self, device: str) -> None:
+        label = self._port_device_to_label.get(device, device)
+        self.var_port_display.set(label)
+
     def refresh_ports(self, initial=False):
-        ports = list_serial_ports()
-        self.cbo_port["values"] = ports
+        entries = list_serial_port_entries()
+        ports = [device for device, _label in entries]
+        labels = [label for _device, label in entries]
+        self._port_label_to_device = {label: device for device, label in entries}
+        self._port_device_to_label = {device: label for device, label in entries}
+        self.cbo_port["values"] = labels
 
         cur = (self.var_port.get() or "").strip()
         settings = self._load_serial_settings()
@@ -1445,11 +1530,13 @@ class X07LoaderApp(tk.Tk):
             chosen = ports[0] if ports else ""
 
         self.var_port.set(chosen)
+        self._set_port_display(chosen)
         self._update_handshake_ui()
 
         if initial:
             if ports:
-                self.log(f"[INFO] COM ports loaded: {', '.join(ports[:10])}{'...' if len(ports) > 10 else ''}")
+                shown = labels[:6]
+                self.log(f"[INFO] COM ports loaded: {'; '.join(shown)}{' ...' if len(labels) > 6 else ''}")
             else:
                 self.log("[WARN] No COM ports detected. Plug adapter and click Refresh.")
         else:
@@ -2217,6 +2304,7 @@ class X07LoaderApp(tk.Tk):
         try:
             with self._open_for_typing() as ser:
                 self.log(f"[INFO] Opened {ser.port} for CAS/K7 receive: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
+                self._prepare_raw_transfer(ser)
                 ser.timeout = 0.2
                 while True:
                     if self.cancel_event.is_set():
@@ -2249,6 +2337,11 @@ class X07LoaderApp(tk.Tk):
             self.log("[WARN] No data received. Did SAVE\"COM:\" start?")
             self._set_progress(0.0, "no data")
             return
+
+        trimmed_buf, skipped = trim_leading_basic_junk(bytes(buf))
+        if skipped:
+            buf = bytearray(trimmed_buf)
+            self.log(f"[WARN] Discarded {skipped} leading byte(s) before tokenized BASIC payload.")
 
         try:
             out_path.write_bytes(header + bytes(buf))
