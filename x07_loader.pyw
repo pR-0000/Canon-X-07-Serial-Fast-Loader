@@ -1,5 +1,6 @@
 import argparse
 import configparser
+import errno
 from pathlib import Path
 import re
 import subprocess
@@ -9,6 +10,7 @@ import time
 from typing import Protocol
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import unicodedata
 
 IS_MACOS = sys.platform == "darwin"
 
@@ -59,6 +61,8 @@ LOADER_CAS_NAME = "loader.cas"
 BASIC_START = 0x0553
 CAS_FIXED_BASE = 0x0010  # fixed (validated for SEND)
 SAVE_IDLE_TIMEOUT_S = 1.25  # end capture if no bytes for this duration (after any data received)
+X07_BASIC_MAX_ENCODED_BODY_BYTES = 254  # conservative limit inferred from CASUTIL buffer sizes
+X07_BASIC_MAX_RECORD_BYTES = X07_BASIC_MAX_ENCODED_BODY_BYTES + 5  # ptr(2) + line(2) + body + EOL(1)
 
 
 def settings_config_path() -> Path:
@@ -156,10 +160,13 @@ if IS_MACOS and DARWIN_TERMIOS_AVAILABLE:
             self._rtscts = bool(rtscts)
             self._fd: int | None = None
             self._rts = True
+            self._dtr = True
 
             try:
                 self._fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY)
                 self._configure_port()
+                self._apply_open_line_states()
+                self.reset_input_buffer()
             except Exception:
                 self.close()
                 raise
@@ -193,6 +200,25 @@ if IS_MACOS and DARWIN_TERMIOS_AVAILABLE:
         def rts(self, value: bool) -> None:
             self._rts = bool(value)
             self._set_rts_state()
+
+        def _set_modem_line(self, bit_name: str, enabled: bool) -> None:
+            fd = self._fd
+            if fd is None:
+                return
+            request = getattr(termios, "TIOCMBIS", None) if enabled else getattr(termios, "TIOCMBIC", None)
+            bit = getattr(termios, bit_name, None)
+            if request is None or bit is None:
+                return
+            try:
+                fcntl.ioctl(fd, request, array.array("I", [bit]), True)
+            except OSError as e:
+                if e.errno not in (errno.EINVAL, errno.ENOTTY):
+                    raise
+
+        def _apply_open_line_states(self) -> None:
+            self._set_dtr_state()
+            if not self._rtscts:
+                self._set_rts_state()
 
         def _configure_port(self) -> None:
             fd = self._require_open_fd()
@@ -251,17 +277,10 @@ if IS_MACOS and DARWIN_TERMIOS_AVAILABLE:
                 fcntl.ioctl(fd, IOSSIOSPEED, array.array("i", [custom_baud]), True)
 
         def _set_rts_state(self) -> None:
-            fd = self._fd
-            if fd is None:
-                return
-            request = getattr(termios, "TIOCMBIS", None) if self._rts else getattr(termios, "TIOCMBIC", None)
-            bit = getattr(termios, "TIOCM_RTS", None)
-            if request is None or bit is None:
-                return
-            try:
-                fcntl.ioctl(fd, request, array.array("I", [bit]), True)
-            except Exception:
-                pass
+            self._set_modem_line("TIOCM_RTS", self._rts)
+
+        def _set_dtr_state(self) -> None:
+            self._set_modem_line("TIOCM_DTR", self._dtr)
 
         def fileno(self) -> int:
             return self._require_open_fd()
@@ -1022,6 +1041,83 @@ def trim_leading_basic_junk(payload: bytes, max_skip: int = 32) -> tuple[bytes, 
     return payload, 0
 
 
+def _parse_tokenized_basic_payload_any_base(payload: bytes) -> tuple[int, list[tuple[int, bytes]]]:
+    """Parse a tokenized BASIC payload even if it starts at a later BASIC line.
+
+    The returned base is inferred from the first line pointer. This is useful to
+    diagnose captures that begin in the middle of a program: the absolute line
+    pointer chain can still be self-consistent even when the file no longer
+    starts at BASIC_START.
+    """
+    lines: list[tuple[int, bytes]] = []
+    pos = 0
+    inferred_base: int | None = None
+    last_line_number = 0
+
+    while pos + 4 <= len(payload):
+        next_ptr = payload[pos] | (payload[pos + 1] << 8)
+        if next_ptr == 0:
+            break
+
+        line_number = payload[pos + 2] | (payload[pos + 3] << 8)
+        if line_number <= last_line_number:
+            raise RuntimeError(
+                f"Unexpected BASIC payload format: line numbers not strictly increasing "
+                f"(got {line_number} after {last_line_number})."
+            )
+        end = payload.find(b"\x00", pos + 4)
+        if end < 0:
+            raise RuntimeError("Unexpected BASIC payload format: missing line terminator.")
+
+        current_base = next_ptr - (end + 1)
+        if not (0 <= current_base <= 0xFFFF):
+            raise RuntimeError(
+                f"Unexpected BASIC payload format: invalid inferred base 0x{current_base & 0xFFFF:04X}."
+            )
+
+        if inferred_base is None:
+            inferred_base = current_base
+        elif next_ptr != inferred_base + end + 1:
+            raise RuntimeError(
+                f"Unexpected BASIC payload format: inconsistent line pointer 0x{next_ptr:04X} "
+                f"(expected 0x{(inferred_base + end + 1) & 0xFFFF:04X})."
+            )
+
+        lines.append((line_number, bytes(payload[pos + 4:end])))
+        last_line_number = line_number
+        pos = end + 1
+
+    if not lines or inferred_base is None:
+        raise RuntimeError("Unexpected BASIC payload format: no tokenized BASIC lines found.")
+
+    return inferred_base, lines
+
+
+def detect_truncated_basic_capture(payload: bytes, max_skip: int = 128) -> tuple[int, int, int] | None:
+    """Detect when the capture starts in the middle of the first BASIC line.
+
+    Returns (skip, inferred_base, first_line_number) when a valid BASIC line
+    chain begins later in the buffer. The inferred base lets us distinguish a
+    simple leading-junk case from a later line boundary inside the program.
+    """
+    if len(payload) < 8:
+        return None
+
+    limit = min(max_skip, max(0, len(payload) - 4))
+    for skip in range(1, limit + 1):
+        candidate = payload[skip:]
+        try:
+            inferred_base, lines = _parse_tokenized_basic_payload_any_base(candidate)
+        except Exception:
+            continue
+
+        if len(lines) < 2:
+            continue
+        return skip, inferred_base, lines[0][0]
+
+    return None
+
+
 def _format_serial_port_label(port_info) -> str:
     device = str(getattr(port_info, "device", "") or "").strip()
     parts = []
@@ -1108,6 +1204,49 @@ def build_cas_header_from_filename(path: Path) -> bytes:
     name_field = name.encode("ascii", errors="replace").ljust(6, b"\x00")
 
     return (b"\xD3" * 10) + name_field
+
+
+def sanitize_basic_source_text(source: str) -> tuple[str, int, int]:
+    """Remove invisible/control characters that would otherwise pollute tokenization.
+
+    Returns (sanitized_text, removed_count, normalized_space_count).
+    """
+    removed = 0
+    normalized_spaces = 0
+    out: list[str] = []
+
+    if source.startswith("\ufeff"):
+        source = source[1:]
+        removed += 1
+
+    for ch in source:
+        if ch in "\r\n":
+            out.append(ch)
+            continue
+        if ch == "\t":
+            out.append(" ")
+            normalized_spaces += 1
+            continue
+
+        category = unicodedata.category(ch)
+        if category == "Zs":
+            if ch != " ":
+                normalized_spaces += 1
+            out.append(" ")
+            continue
+        if category.startswith("C"):
+            removed += 1
+            continue
+
+        out.append(ch)
+
+    return "".join(out), removed, normalized_spaces
+
+
+def read_basic_source_text(path: Path) -> tuple[str, int, int]:
+    """Read a BASIC listing as UTF-8 text and sanitize invisible characters."""
+    source = path.read_text(encoding="utf-8", errors="replace")
+    return sanitize_basic_source_text(source)
 
 
 class AutoScrollFrame(ttk.Frame):
@@ -2019,7 +2158,7 @@ class X07LoaderApp(tk.Tk):
         self._set_status("converting BASIC to cassette stream")
         self._set_progress(0, "reading BASIC listing...")
 
-        source = self.basic_file.read_text(encoding="utf-8", errors="replace")
+        source, removed_invisible, normalized_spaces = read_basic_source_text(self.basic_file)
         parsed = _parse_basic_source(source)
         payload = bytearray()
         line_pointer = BASIC_START
@@ -2027,6 +2166,11 @@ class X07LoaderApp(tk.Tk):
 
         self.log(f"[INFO] Converting BASIC listing: {self.basic_file.name}")
         self.log(f"[INFO] Output cassette stream: {out_path.name}")
+        if removed_invisible or normalized_spaces:
+            self.log(
+                f"[INFO] Sanitized BASIC source: removed {removed_invisible} invisible/control character(s), "
+                f"normalized {normalized_spaces} whitespace character(s)."
+            )
 
         for idx, (line_number, body) in enumerate(parsed, start=1):
             if self.cancel_event.is_set():
@@ -2034,6 +2178,16 @@ class X07LoaderApp(tk.Tk):
 
             encoded = _tokenize_basic_body(body)
             record_len = 4 + len(encoded) + 1
+            if len(encoded) > X07_BASIC_MAX_ENCODED_BODY_BYTES:
+                self.log(
+                    f"[WARN] BASIC line {line_number} tokenizes to {len(encoded)} bytes "
+                    f"(conservative CASUTIL-safe limit: {X07_BASIC_MAX_ENCODED_BODY_BYTES})."
+                )
+            elif len(encoded) >= (X07_BASIC_MAX_ENCODED_BODY_BYTES - 8):
+                self.log(
+                    f"[INFO] BASIC line {line_number} is near the conservative tokenized size limit: "
+                    f"{len(encoded)} bytes."
+                )
             line_pointer += record_len
             if line_pointer > 0xFFFF:
                 raise RuntimeError("Tokenized BASIC program exceeds 16-bit pointer range.")
@@ -2124,7 +2278,13 @@ class X07LoaderApp(tk.Tk):
         self._set_status("typing BASIC (.txt/.bas)")
         self._set_progress(0, "starting...")
 
-        lines = self.basic_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        source, removed_invisible, normalized_spaces = read_basic_source_text(self.basic_file)
+        if removed_invisible or normalized_spaces:
+            self.log(
+                f"[INFO] Sanitized BASIC source: removed {removed_invisible} invisible/control character(s), "
+                f"normalized {normalized_spaces} whitespace character(s)."
+            )
+        lines = source.splitlines()
         lines = [ln.rstrip("\r\n") for ln in lines if ln.strip() != ""]
         total = max(1, len(lines) + 1)
 
@@ -2289,10 +2449,9 @@ class X07LoaderApp(tk.Tk):
 
     def _receive_cas_raw_impl(self, out_path: Path):
         self._set_status("receiving CAS/K7 raw bytes")
-        self._set_progress(0, "waiting for data...")
+        self._set_progress(0, "arming receiver...")
 
-        self.log(f'[INFO] PC ready to receive into: {out_path}')
-        self.log('[INFO] X-07 side: type SAVE"COM:" (optionally with a name) then press RETURN.')
+        self.log(f'[INFO] Preparing CAS/K7 receive into: {out_path}')
         self.log(f"[INFO] Capture ends after ~{SAVE_IDLE_TIMEOUT_S:.2f}s of inactivity.")
 
         header = build_cas_header_from_filename(out_path)
@@ -2305,7 +2464,8 @@ class X07LoaderApp(tk.Tk):
             with self._open_for_typing() as ser:
                 self.log(f"[INFO] Opened {ser.port} for CAS/K7 receive: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
                 self._prepare_raw_transfer(ser)
-                ser.timeout = 0.2
+                self._set_progress(0, "receiver armed - start SAVE\"COM:\" now")
+                self.log('[OK] Receiver armed. Now type SAVE"COM:" on the X-07, then press RETURN.')
                 while True:
                     if self.cancel_event.is_set():
                         raise InterruptedError("Cancelled during CAS/K7 receive.")
@@ -2343,14 +2503,44 @@ class X07LoaderApp(tk.Tk):
             buf = bytearray(trimmed_buf)
             self.log(f"[WARN] Discarded {skipped} leading byte(s) before tokenized BASIC payload.")
 
+        payload_bytes = bytes(buf)
+        payload_valid = True
         try:
-            out_path.write_bytes(header + bytes(buf))
+            parse_tokenized_basic_payload(payload_bytes)
+        except Exception:
+            payload_valid = False
+
+        if not payload_valid:
+            capture_hint = detect_truncated_basic_capture(payload_bytes)
+            head_hex = " ".join(f"{b:02X}" for b in payload_bytes[:16])
+            self.log(f"[WARN] Received payload does not look like a clean tokenized BASIC stream. Head: {head_hex}")
+            if capture_hint is not None:
+                skip, inferred_base, first_line = capture_hint
+                self.log(
+                    f"[WARN] A valid BASIC line chain starts only after +{skip} byte(s) "
+                    f"(implied base=0x{inferred_base:04X}, first surviving line={first_line})."
+                )
+                self.log(
+                    "[WARN] This usually means the PC missed the beginning of the SAVE\"COM:\" stream; "
+                    "it is not a BASIC tokenization bug."
+                )
+            else:
+                self.log(
+                    "[WARN] The capture could not be recognized as a clean BASIC stream. "
+                    "If reload fails, the first bytes were likely lost or corrupted during receive."
+                )
+
+        try:
+            out_path.write_bytes(header + payload_bytes)
         except Exception as e:
             self.log(f"[ERROR] Failed to save file: {e}")
             return
 
         self._set_progress(100.0, f"CAS/K7 recv done ({len(buf)} bytes)")
-        self.log(f"[OK] Received {len(buf)} bytes. Saved: {out_path.name}")
+        if payload_valid:
+            self.log(f"[OK] Received {len(buf)} bytes. Saved: {out_path.name}")
+        else:
+            self.log(f"[WARN] Received {len(buf)} bytes, but the saved stream looks truncated/corrupted: {out_path.name}")
 
     # ---------------- Remote keyboard ----------------
     def toggle_remote_keyboard(self):
