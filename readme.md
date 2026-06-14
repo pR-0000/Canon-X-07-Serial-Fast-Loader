@@ -16,6 +16,7 @@ Il prend en charge :
 * **BASIC (cassette en flux brut)** : envoi *et* réception de fichiers `.cas` / `.k7` via `LOAD"COM:"` et `SAVE"COM:"`
 * **Conversion BASIC** : conversion d’un listing `.txt` / `.bas` en flux cassette tokenisé `.cas` / `.k7`, et inversement
 * **ASM (rapide)** : transfert d’un loader puis envoi rapide d’un binaire `.bin`
+* **RAM DUMP (fichiers RAM type D)** : extraction de fichiers RAM type `D` vers des `.ramd.bin` conservant l’entrée mémoire complète
 * **Clavier distant (REMOTE KEYBOARD)** : saisie depuis le PC vers le X-07
 
 L’application fournit :
@@ -255,6 +256,22 @@ Principe :
 3. Le PC envoie ensuite le binaire sous forme ASCII hex.
 4. Le loader copie les données en mémoire puis exécute automatiquement le programme.
 
+Avec une seule puce d’extension **8 Ko** utilisée comme RAM continue en `2000h-3FFFh`, la zone totale disponible pour le programme machine est de **8192 octets**.
+
+Le loader réserve désormais un `RAM file` minimal avec :
+
+```basic
+FSET 13
+```
+
+Cela laisse une **limite théorique maximale de 8179 octets** pour le binaire chargé à partir de `&H2000` :
+
+```text
+8192 - 13 = 8179
+```
+
+En pratique, il reste conseillé de garder une petite marge sous cette limite si le programme doit rester robuste après un cycle `OFF/ON`.
+
 ---
 
 ## Méthodes
@@ -274,6 +291,8 @@ Puis sur PC :
 * cliquer sur **Send ASM loader**
 
 Le loader est transféré comme un flux cassette (raw).
+
+Le loader BASIC fourni inclut maintenant `FSET 13` avant le `CLEAR`, afin de réserver automatiquement le plus petit `RAM file` possible sans sacrifier inutilement d’espace pour le programme machine.
 
 ---
 
@@ -298,17 +317,6 @@ Automatique :
 4. envoi binaire
 
 ---
-
-## Adresses
-
-* **Loader addr** : adresse du loader (ex : `0x1800`)
-* **ASM addr** : adresse du programme (ex : `0x2000`)
-
-⚠️ Doit correspondre à :
-
-```asm
-ORG $2000
-```
 
 ## Adresse de chargement
 
@@ -335,6 +343,36 @@ Si le binaire est copié à une autre adresse que celle prévue (ORG), alors :
 * et les données référencées
 
 peuvent devenir invalides (comportement imprévisible ou crash).
+
+---
+
+# RAM DUMP
+
+Objectif : extraire les fichiers RAM type `D` du X-07 vers des fichiers `.ramd.bin`, en conservant le header RAM complet tel qu’il est stocké en mémoire.
+
+Dans l’interface graphique :
+
+1. Cliquer sur **Dump RAM type D files...**
+2. Choisir le dossier de sortie sur le PC.
+3. Sur le X-07, taper :
+
+```basic
+LOAD"COM:"
+```
+
+4. Attendre que la console PC indique : **Receiver armed. Now type RUN on the X-07.**
+5. Sur le X-07, taper :
+
+```basic
+RUN
+```
+
+Fonctionnement :
+
+* le script envoie d’abord un petit chargeur BASIC tokenisé via `LOAD"COM:"`
+* ce chargeur lance ensuite un dumper assembleur temporaire
+* le flux reçu côté PC est sauvegardé en un fichier `.ramd.bin` par entrée type `D`
+* **Cancel transfer** interrompt aussi ce dump pendant l’envoi, l’attente ou la réception
 
 ---
 
@@ -379,6 +417,7 @@ python x07_loader.pyw --cli receive-cas dump.cas --port COM3
 python x07_loader.pyw --cli send-loader --port COM3
 python x07_loader.pyw --cli send-bin prog.bin --port COM3
 python x07_loader.pyw --cli send-asm prog.bin --port COM3
+python x07_loader.pyw --cli dump-ram-d dump_dir --port COM3
 python x07_loader.pyw --cli disable-slave --port COM3
 ```
 
@@ -386,6 +425,7 @@ Remarques :
 
 * Le mode GUI reste le comportement par défaut si aucun argument n'est fourni.
 * Le mode console ne propose pas de `REMOTE KEYBOARD` interactif, car les flèches et touches spéciales sont généralement captées par le terminal lui-même sans gestion bas niveau spécifique.
+* Pour `dump-ram-d`, lancer d’abord la commande côté PC, saisir `LOAD"COM:"` sur le X-07, attendre le message **Receiver armed**, puis taper `RUN`.
 
 ---
 
@@ -426,6 +466,7 @@ It supports:
 * **BASIC (cassette raw stream)**: sending *and* receiving `.cas` / `.k7` files via `LOAD"COM:"` and `SAVE"COM:"`
 * **BASIC conversion**: converting a `.txt` / `.bas` listing to a tokenized `.cas` / `.k7` cassette stream, and back again
 * **ASM (fast)**: transferring a loader, then sending a `.bin` binary quickly
+* **RAM DUMP (type D RAM files)**: extracting RAM type `D` files to `.ramd.bin` files while preserving the full in-memory header
 * **Remote keyboard (REMOTE KEYBOARD)**: typing from the PC directly to the X-07
 
 The application provides:
@@ -669,6 +710,22 @@ Principle:
 3. The PC sends the binary as ASCII hex
 4. The loader copies the data into memory and executes the program
 
+With a single **8 KB** expansion RAM chip used as continuous RAM in `2000h-3FFFh`, the total space available for the machine-code program is **8192 bytes**.
+
+The loader now reserves a minimal `RAM file` with:
+
+```basic
+FSET 13
+```
+
+This leaves a **theoretical maximum size of 8179 bytes** for a binary loaded at `&H2000`:
+
+```text
+8192 - 13 = 8179
+```
+
+In practice, it is still wise to keep a small safety margin below that limit if the program must remain reliable after an `OFF/ON` cycle.
+
 ---
 
 ## Methods
@@ -688,6 +745,8 @@ Then on PC:
 * click **Send ASM loader**
 
 The loader is transferred as a raw cassette stream.
+
+The bundled BASIC loader now includes `FSET 13` before `CLEAR`, so it automatically reserves the smallest practical `RAM file` without wasting unnecessary space from the machine-code area.
 
 ---
 
@@ -710,19 +769,6 @@ Automatic sequence:
 2. send loader
 3. `EXEC&HEE33:RUN`
 4. send binary
-
----
-
-## Addresses
-
-* **Loader addr**: loader memory address (e.g. `0x1800`)
-* **ASM addr**: program memory address (e.g. `0x2000`)
-
-⚠️ Must match:
-
-```asm
-ORG $2000
-```
 
 ---
 
@@ -754,6 +800,36 @@ may break (crash or undefined behavior)
 
 ---
 
+# RAM DUMP
+
+Goal: extract X-07 RAM type `D` files to `.ramd.bin` files while preserving the complete RAM entry header exactly as stored in memory.
+
+In the GUI:
+
+1. Click **Dump RAM type D files...**
+2. Choose the output folder on the PC.
+3. On the X-07, type:
+
+```basic
+LOAD"COM:"
+```
+
+4. Wait until the PC console says: **Receiver armed. Now type RUN on the X-07.**
+5. On the X-07, type:
+
+```basic
+RUN
+```
+
+Operation:
+
+* the script first sends a small tokenized BASIC bootstrap through `LOAD"COM:"`
+* that bootstrap then starts a temporary ASM dumper
+* the received stream is saved on the PC as one `.ramd.bin` file per type `D` entry
+* **Cancel transfer** also aborts this dump during send, wait, or receive stages
+
+---
+
 # Remote keyboard via SLAVE mode
 
 Goal: control the X-07 like a terminal.
@@ -780,13 +856,13 @@ Safety:
 The same script can also be used from a terminal without the GUI.
 Le même script peut aussi être utilisé depuis un terminal sans interface graphique.
 
-bash
+```bash
 python x07_loader.pyw --cli --help
-
+```
 
 Main commands / Commandes principales:
 
-bash
+```bash
 python x07_loader.pyw --cli ports
 python x07_loader.pyw --cli convert-basic prog.bas prog.cas
 python x07_loader.pyw --cli convert-cas prog.cas prog.bas
@@ -796,14 +872,16 @@ python x07_loader.pyw --cli receive-cas dump.cas --port COM3
 python x07_loader.pyw --cli send-loader --port COM3
 python x07_loader.pyw --cli send-bin prog.bin --port COM3
 python x07_loader.pyw --cli send-asm prog.bin --port COM3
+python x07_loader.pyw --cli dump-ram-d dump_dir --port COM3
 python x07_loader.pyw --cli disable-slave --port COM3
-
+```
 
 Notes:
 
 * GUI mode remains the default when no argument is provided.
 * Le mode GUI reste le comportement par défaut si aucun argument n'est fourni.
 * Console mode does not provide an interactive REMOTE KEYBOARD, because arrow keys and special keys are usually handled by the terminal itself unless platform-specific raw console handling is added.
+* For `dump-ram-d`, start the command on the PC first, type `LOAD"COM:"` on the X-07, wait for **Receiver armed**, then type `RUN`.
 
 ---
 

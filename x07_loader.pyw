@@ -57,6 +57,15 @@ DEFAULT_LOAD_ADDR = 0x2000
 DEFAULT_LOADER_ADDR = 0x1F00
 POST_LOADER_EXEC_DELAY_S = 3.0
 LOADER_CAS_NAME = "loader.cas"
+DUMP_D_BIN_NAME = "dump_d.bin"
+DUMP_D_LOAD_ADDR = DEFAULT_LOAD_ADDR
+DUMP_D_MAGIC = b"XDMP"
+DUMP_D_VERSION = 1
+DUMP_D_STATUS_OK = 0
+DUMP_D_STATUS_WARN = 1
+DUMP_D_READ_TIMEOUT_S = 3.0
+DUMP_D_START_TIMEOUT_S = 15.0
+POST_CAS_LOAD_SETTLE_S = 0.75
 
 BASIC_START = 0x0553
 CAS_FIXED_BASE = 0x0010  # fixed (validated for SEND)
@@ -1206,6 +1215,26 @@ def build_cas_header_from_filename(path: Path) -> bytes:
     return (b"\xD3" * 10) + name_field
 
 
+def decode_ram_file_name(name_bytes: bytes) -> str:
+    raw = name_bytes[:6].decode("ascii", errors="replace").rstrip(" ")
+    return raw or "NONAME"
+
+
+def sanitize_dump_file_stem(name: str) -> str:
+    safe: list[str] = []
+    for ch in name:
+        if ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch in ("-", "_"):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    stem = "".join(safe).strip("_")
+    return stem or "NONAME"
+
+
+def build_tokenized_basic_from_source_text(source: str) -> bytes:
+    return build_tokenized_basic_payload(_parse_basic_source(source))
+
+
 def sanitize_basic_source_text(source: str) -> tuple[str, int, int]:
     """Remove invisible/control characters that would otherwise pollute tokenization.
 
@@ -1306,8 +1335,8 @@ class X07LoaderApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Canon X-07 Serial Fast Loader")
-        self.geometry("1040x710")
-        self.minsize(920, 580)
+        self.geometry("1040x730")
+        self.minsize(800, 400)
 
         # files
         self.basic_file: Path | None = None
@@ -1505,6 +1534,16 @@ class X07LoaderApp(tk.Tk):
         btn_one_click = ttk.Button(ra, text="One click: send loader + ASM (SLAVE mode)", command=self.send_loader_and_bin)
         btn_one_click.pack(side="left", padx=(10, 0))
         self._transfer_controls.append(btn_one_click)
+
+        # ---- RAM DUMP ----
+        ram_dump = ttk.LabelFrame(main, text="RAM DUMP", padding=6)
+        ram_dump.pack(fill="x", pady=(0, 6))
+
+        rd = ttk.Frame(ram_dump)
+        rd.pack(fill="x")
+        btn_dump_d = ttk.Button(rd, text='Dump RAM type D files (LOAD"COM:")', command=self.dump_ram_d_files)
+        btn_dump_d.pack(side="left")
+        self._transfer_controls.append(btn_dump_d)
 
         # ---- Remote keyboard ----
         kbd = ttk.LabelFrame(main, text='Remote keyboard via SLAVE mode (PC -> X-07)', padding=6)
@@ -1812,7 +1851,59 @@ class X07LoaderApp(tk.Tk):
     def _loader_cas_path(self) -> Path:
         return Path(__file__).with_name(LOADER_CAS_NAME)
 
+    def _dump_d_bin_path(self) -> Path:
+        return Path(__file__).resolve().parent / "source" / DUMP_D_BIN_NAME
 
+    def _build_dump_d_loader_source(self, data: bytes) -> str:
+        if not data:
+            raise RuntimeError("RAM D dumper binary is empty.")
+
+        start_addr = DUMP_D_LOAD_ADDR & 0xFFFF
+        end_addr = (start_addr + len(data) - 1) & 0xFFFF
+        if end_addr < start_addr:
+            raise RuntimeError("RAM D dumper wraps around the 16-bit address space.")
+
+        lines = [
+            f"10 CLEAR {len(data)},&H{start_addr:04X}",
+            f"20 FOR I=&H{start_addr:04X} TO &H{end_addr:04X}",
+            '30 READ A$:POKE I,VAL("&H"+A$):NEXT',
+            f"40 EXEC &H{start_addr:04X}",
+        ]
+
+        line_number = 50
+        chunk_size = 16
+        for offset in range(0, len(data), chunk_size):
+            chunk = data[offset:offset + chunk_size]
+            lines.append(f"{line_number} DATA " + ",".join(f"{b:02X}" for b in chunk))
+            line_number += 10
+
+        return "\n".join(lines) + "\n"
+
+    def _patch_runtime_baud(self, data: bytes, *, label: str) -> bytes:
+        baud = int(self.var_xfer_baud.get()) & 0xFFFF
+        pattern = bytes([0xDD, 0x21, 0x40, 0x1F])  # ld ix,8000
+        repl = bytes([0xDD, 0x21, baud & 0xFF, (baud >> 8) & 0xFF])
+
+        patched = bytearray(data)
+        idx = patched.find(pattern)
+        if idx < 0:
+            raise RuntimeError(f"Unexpected {label} format: runtime baud pattern not found.")
+        if patched.find(pattern, idx + 1) >= 0:
+            raise RuntimeError(f"Unexpected {label} format: runtime baud pattern is ambiguous.")
+
+        patched[idx:idx + 4] = repl
+        return bytes(patched)
+
+    def _build_dump_d_binary(self) -> bytes:
+        dump_path = self._dump_d_bin_path()
+        if not dump_path.exists():
+            raise RuntimeError(f"Missing RAM D dumper binary: {dump_path}")
+        return self._patch_runtime_baud(dump_path.read_bytes(), label=DUMP_D_BIN_NAME)
+
+    def _build_dump_d_loader_payload(self) -> bytes:
+        data = self._build_dump_d_binary()
+        source = self._build_dump_d_loader_source(data)
+        return build_tokenized_basic_from_source_text(source)
 
     def _build_loader_cas_payload(self) -> bytes:
         template_path = self._loader_cas_path()
@@ -1957,13 +2048,7 @@ class X07LoaderApp(tk.Tk):
         relocate_absolute_operands({0x22, 0x2A, 0x32, 0x3A, 0xCD, 0xC3})
         relocate_absolute_operands({0x01, 0x11, 0x21, 0x31}, skip_indexed_loads=True)
 
-        baud = int(self.var_xfer_baud.get()) & 0xFFFF
-        baud_pattern = bytes([0xDD, 0x21, 0x40, 0x1F])  # template uses 8000 baud
-        baud_repl = bytes([0xDD, 0x21, baud & 0xFF, (baud >> 8) & 0xFF])
-        idx = loader_bytes.find(baud_pattern)
-        if idx < 0:
-            raise RuntimeError("Unexpected loader.cas format: loader baud pattern not found.")
-        loader_bytes[idx:idx + 4] = baud_repl
+        loader_bytes = bytearray(self._patch_runtime_baud(bytes(loader_bytes), label="loader.cas DATA image"))
 
         offset = 0
         for start_, end_, item_count in data_spans:
@@ -1979,14 +2064,17 @@ class X07LoaderApp(tk.Tk):
 
         return bytes(payload)
 
-    def _build_loader_ascii_frame(self, data: bytes) -> bytes:
+    def _build_ascii_frame_for_addr(self, data: bytes, addr: int) -> bytes:
         if not data:
             raise RuntimeError("Binary is empty.")
-        addr = self._parse_addr() & 0xFFFF
+        addr &= 0xFFFF
         size = len(data)
         if size > 0xFFFF:
             raise RuntimeError("Binary too large for 16-bit ASCII loader header.")
         return ("L" + f"{addr:04X}" + f"{size:04X}" + data.hex().upper()).encode("ascii")
+
+    def _build_loader_ascii_frame(self, data: bytes) -> bytes:
+        return self._build_ascii_frame_for_addr(data, self._parse_addr())
 
     def _send_loader_cas_raw(self, ser: SerialPortLike, *, progress_base: float = 0.0, progress_span: float = 100.0):
         payload = self._build_loader_cas_payload()
@@ -2013,10 +2101,10 @@ class X07LoaderApp(tk.Tk):
         self._type_line(ser, 'LOAD"COM:"')
         pre_stream_delay = max(float(self.var_line.get()), 0.35)
         self.log(f"[INFO] Waiting {pre_stream_delay:.2f}s for X-07 to enter LOAD\"COM:\" receive mode...")
-        time.sleep(pre_stream_delay)
+        self._sleep_with_cancel(pre_stream_delay, 'LOAD"COM:" arm delay')
         self._send_loader_cas_raw(ser, progress_base=progress_base, progress_span=progress_span)
         post_stream_delay = max(0.25, float(self.var_line.get()))
-        time.sleep(post_stream_delay)
+        self._sleep_with_cancel(post_stream_delay, "post-loader cassette delay")
         self._type_line(ser, "EXEC&HEE33:RUN")
         self.log("[INFO] Remote loader transferred and started.")
 
@@ -2030,11 +2118,11 @@ class X07LoaderApp(tk.Tk):
             ser.write(bytes([ch]))
             ser.flush()
             self._tcdrain(ser)
-            time.sleep(char_delay)
+            self._sleep_with_cancel(char_delay, "BASIC typing delay")
         ser.write(b"\r")
         ser.flush()
         self._tcdrain(ser)
-        time.sleep(line_delay)
+        self._sleep_with_cancel(line_delay, "BASIC line delay")
 
     def _tcdrain(self, ser: SerialPortLike):
         try:
@@ -2047,6 +2135,16 @@ class X07LoaderApp(tk.Tk):
             termios.tcdrain(fd)
         except Exception:
             pass
+
+    def _sleep_with_cancel(self, duration_s: float, label: str):
+        deadline = time.time() + max(0.0, float(duration_s))
+        while True:
+            if self.cancel_event.is_set():
+                raise InterruptedError(f"Cancelled during {label}.")
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.05, remaining))
 
     def _stream_raw_payload(self, ser: SerialPortLike, payload: bytes, label: str,
                             progress_base: float = 0.0, progress_span: float = 100.0,
@@ -2070,6 +2168,12 @@ class X07LoaderApp(tk.Tk):
                 ser.rts = False
             except Exception:
                 pass
+
+    def _post_cassette_send_settle(self, label: str = 'LOAD"COM:"') -> float:
+        settle_s = max(POST_CAS_LOAD_SETTLE_S, float(self.var_line.get()))
+        self.log(f"[INFO] Waiting {settle_s:.2f}s for the X-07 to leave {label} receive mode...")
+        self._sleep_with_cancel(settle_s, f"{label} settle delay")
+        return settle_s
 
     def _send_ascii_frame(self, ser: SerialPortLike, frame: bytes, label: str,
                           progress_base: float = 0.0, progress_span: float = 100.0,
@@ -2102,6 +2206,212 @@ class X07LoaderApp(tk.Tk):
                 progress_span=progress_span,
                 chunk_size=256,
             )
+
+    def _read_exact_bytes(self, ser: SerialPortLike, size: int, label: str,
+                          *, timeout_s: float = DUMP_D_READ_TIMEOUT_S) -> bytes:
+        buf = bytearray()
+        deadline = time.time() + max(0.1, float(timeout_s))
+
+        while len(buf) < size:
+            if self.cancel_event.is_set():
+                raise InterruptedError(f"Cancelled while receiving {label}.")
+
+            chunk = ser.read(size - len(buf))
+            if chunk:
+                buf.extend(chunk)
+                deadline = time.time() + max(0.1, float(timeout_s))
+                continue
+
+            if time.time() >= deadline:
+                raise RuntimeError(f"Timed out while receiving {label} ({len(buf)}/{size} bytes).")
+
+        return bytes(buf)
+
+    def _read_until_marker(self, ser: SerialPortLike, marker: bytes, label: str,
+                           *, timeout_s: float = DUMP_D_START_TIMEOUT_S) -> tuple[bytes, bytes]:
+        if not marker:
+            raise RuntimeError(f"Empty marker for {label}.")
+
+        buf = bytearray()
+        deadline = time.time() + max(0.1, float(timeout_s))
+        saw_any = False
+
+        while True:
+            if self.cancel_event.is_set():
+                raise InterruptedError(f"Cancelled while waiting for {label}.")
+
+            chunk = ser.read(64)
+            if chunk:
+                buf.extend(chunk)
+                deadline = time.time() + max(0.1, float(timeout_s))
+                if not saw_any:
+                    saw_any = True
+                    head = " ".join(f"{b:02X}" for b in buf[:16])
+                    self.log(f"[INFO] First byte(s) received while waiting for {label}: {len(buf)} byte(s), head={head}")
+                idx = buf.find(marker)
+                if idx >= 0:
+                    prefix = bytes(buf[:idx])
+                    tail = bytes(buf[idx + len(marker):])
+                    return prefix, tail
+                continue
+
+            if time.time() >= deadline:
+                head = " ".join(f"{b:02X}" for b in buf[:16])
+                raise RuntimeError(
+                    f"Timed out while waiting for {label} (captured {len(buf)} byte(s), head={head or 'none'})."
+                )
+
+    def _read_exact_with_pending(self, ser: SerialPortLike, pending: bytes, size: int, label: str,
+                                 *, timeout_s: float = DUMP_D_READ_TIMEOUT_S) -> tuple[bytes, bytes]:
+        buf = bytearray(pending)
+        deadline = time.time() + max(0.1, float(timeout_s))
+
+        while len(buf) < size:
+            if self.cancel_event.is_set():
+                raise InterruptedError(f"Cancelled while receiving {label}.")
+
+            chunk = ser.read(size - len(buf))
+            if chunk:
+                buf.extend(chunk)
+                deadline = time.time() + max(0.1, float(timeout_s))
+                continue
+
+            if time.time() >= deadline:
+                raise RuntimeError(f"Timed out while receiving {label} ({len(buf)}/{size} bytes).")
+
+        return bytes(buf[:size]), bytes(buf[size:])
+
+    def _receive_dump_d_stream(self, ser: SerialPortLike, *, start_timeout_s: float = DUMP_D_START_TIMEOUT_S):
+        skipped, pending = self._read_until_marker(ser, DUMP_D_MAGIC, "RAM D dump magic", timeout_s=start_timeout_s)
+        if skipped:
+            head = " ".join(f"{b:02X}" for b in skipped[:16])
+            self.log(f"[INFO] Skipped {len(skipped)} byte(s) before RAM D dump magic. Head: {head}")
+
+        version_bytes, pending = self._read_exact_with_pending(ser, pending, 1, "RAM D dump version")
+        status_bytes, pending = self._read_exact_with_pending(ser, pending, 1, "RAM D dump status")
+        count_bytes, pending = self._read_exact_with_pending(ser, pending, 2, "RAM D dump file count")
+        version = version_bytes[0]
+        status = status_bytes[0]
+        count = int.from_bytes(count_bytes, "little")
+
+        self.log(f"[INFO] RAM D dump header: version={version}, status={status}, files={count}.")
+        if version != DUMP_D_VERSION:
+            self.log(f"[WARN] Unexpected RAM D dump protocol version: {version}.")
+        if status == DUMP_D_STATUS_WARN:
+            self.log("[WARN] The X-07 reported a malformed or truncated RAM file chain after the parsed entries.")
+
+        entries = []
+        for index in range(count):
+            meta, pending = self._read_exact_with_pending(ser, pending, 4, f"RAM D entry {index + 1} metadata")
+            addr = int.from_bytes(meta[:2], "little")
+            length = int.from_bytes(meta[2:], "little")
+            if length < 14:
+                raise RuntimeError(f"Invalid RAM D entry length from X-07: {length} at 0x{addr:04X}.")
+
+            self._set_progress(60.0 + (index / max(count, 1)) * 40.0, f"receiving RAM D entry {index + 1}/{count}")
+            raw, pending = self._read_exact_with_pending(ser, pending, length, f"RAM D entry {index + 1} payload")
+
+            name = decode_ram_file_name(raw[:6])
+            typ = chr(raw[6]) if len(raw) >= 7 and 32 <= raw[6] <= 126 else "?"
+            self.log(f"[INFO] RAM D entry {index + 1}/{count}: name={name!r}, type={typ}, addr=0x{addr:04X}, len={length}.")
+
+            entries.append({
+                "index": index + 1,
+                "addr": addr,
+                "length": length,
+                "name": name,
+                "type": typ,
+                "raw": raw,
+            })
+
+        return version, status, entries
+
+    def _save_dump_d_entries(self, out_dir: Path, entries, *, status: int):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_lines = [
+            "Canon X-07 RAM type D dump",
+            f"Status: {status}",
+            f"Files: {len(entries)}",
+            "",
+        ]
+
+        used_names: set[str] = set()
+        saved_paths: list[Path] = []
+
+        for entry in entries:
+            base_name = sanitize_dump_file_stem(entry["name"])
+            stem = f"{entry['index']:02d}_{base_name}_0x{entry['addr']:04X}"
+            filename = f"{stem}.ramd.bin"
+            suffix = 2
+            while filename.lower() in used_names:
+                filename = f"{stem}_{suffix}.ramd.bin"
+                suffix += 1
+            used_names.add(filename.lower())
+
+            out_path = out_dir / filename
+            out_path.write_bytes(entry["raw"])
+            saved_paths.append(out_path)
+
+            manifest_lines.append(
+                f"{filename} | name={entry['name']} | addr=0x{entry['addr']:04X} | len={entry['length']}"
+            )
+            self.log(f"[OK] Saved RAM D file: {out_path.name}")
+
+        manifest_path = out_dir / "ram_d_dump_manifest.txt"
+        manifest_path.write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
+        self.log(f"[INFO] Dump manifest: {manifest_path.name}")
+
+        if not saved_paths:
+            self.log("[INFO] No RAM type D file found on the X-07.")
+
+    def dump_ram_d_files(self):
+        p = filedialog.askdirectory(title="Select output folder for RAM type D files")
+        if not p:
+            return
+        out_dir = Path(p)
+        self._run_threaded(lambda: self._dump_ram_d_files_impl(out_dir), "Dump RAM type D files")
+
+    def _dump_ram_d_files_impl(self, out_dir: Path):
+        self._set_status("sending RAM D dumper cassette loader")
+        self._set_progress(0.0, "starting RAM D dump")
+        self.log(f"[INFO] Output folder for RAM D dump: {out_dir}")
+        self.log('[INFO] X-07 side: type LOAD"COM:" then press RETURN before starting the dump.')
+
+        dump_bin = self._build_dump_d_binary()
+        dump_loader_payload = self._build_dump_d_loader_payload()
+        self.log(f"[INFO] RAM D dumper size: {len(dump_bin)} bytes. Load addr: 0x{DUMP_D_LOAD_ADDR:04X}")
+        self.log(f"[INFO] RAM D cassette loader payload: {len(dump_loader_payload)} bytes.")
+        self.log(f"[INFO] Runtime baud for RAM D dumper: {int(self.var_xfer_baud.get())} 8N2")
+
+        try:
+            with self._open_for_typing() as ser:
+                self.log(f"[INFO] Opened {ser.port} for RAM D cassette send: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
+                self._stream_raw_payload(
+                    ser,
+                    dump_loader_payload,
+                    "RAM D cassette loader",
+                    progress_base=0.0,
+                    progress_span=50.0,
+                    chunk_size=64,
+                    final_rts_drop=True,
+                )
+
+            self._post_cassette_send_settle()
+            self.log('[OK] Cassette loader sent. Wait for the X-07 prompt to return, then type RUN to start the RAM D dumper.')
+
+            with self._open_for_raw() as ser:
+                self.log(f"[INFO] Opened {ser.port} for RAM D receive stage: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
+                self._prepare_raw_transfer(ser)
+                self.log('[OK] Receiver armed. Now type RUN on the X-07.')
+                self._set_progress(50.0, 'receiver armed - wait for the prompt, then type RUN on the X-07')
+                version, status, entries = self._receive_dump_d_stream(ser)
+
+        except SERIAL_ERRORS as e:
+            self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
+            return
+
+        self._save_dump_d_entries(out_dir, entries, status=status)
+        self._set_progress(100.0, f"RAM D dump done ({len(entries)} file(s), protocol v{version})")
 
     # ---------------- File pickers ----------------
     def pick_basic(self):
@@ -2365,7 +2675,7 @@ class X07LoaderApp(tk.Tk):
                 self.log(f"[INFO] Opened {ser.port} for one-click loader stage: {ser.baudrate} 8N2 ({self._serial_backend_name(ser)}).")
                 self._send_loader_cas_remote(ser, progress_base=0.0, progress_span=50.0)
                 self._set_progress(50.0, "loader started")
-            time.sleep(POST_LOADER_EXEC_DELAY_S)
+            self._sleep_with_cancel(POST_LOADER_EXEC_DELAY_S, "loader startup delay")
             self._send_current_asm_frame(frame, progress_base=50.0, progress_span=50.0)
         except SERIAL_ERRORS as e:
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
@@ -2433,6 +2743,7 @@ class X07LoaderApp(tk.Tk):
             self.log(f"[ERROR] Cannot open {self.var_port.get()!r}: {e}")
             return
 
+        self._post_cassette_send_settle()
         self._set_progress(100.0, "CAS/K7 send done")
         self.log("[INFO] CAS/K7 raw transfer finished.")
 
@@ -2690,10 +3001,23 @@ class X07CliRunner:
     _send_loader_cas_remote = X07LoaderApp._send_loader_cas_remote
     _type_line = X07LoaderApp._type_line
     _tcdrain = X07LoaderApp._tcdrain
+    _sleep_with_cancel = X07LoaderApp._sleep_with_cancel
     _stream_raw_payload = X07LoaderApp._stream_raw_payload
     _send_ascii_frame = X07LoaderApp._send_ascii_frame
+    _dump_d_bin_path = X07LoaderApp._dump_d_bin_path
+    _build_dump_d_loader_source = X07LoaderApp._build_dump_d_loader_source
+    _patch_runtime_baud = X07LoaderApp._patch_runtime_baud
+    _build_dump_d_binary = X07LoaderApp._build_dump_d_binary
+    _build_dump_d_loader_payload = X07LoaderApp._build_dump_d_loader_payload
+    _build_ascii_frame_for_addr = X07LoaderApp._build_ascii_frame_for_addr
     _build_current_asm_frame = X07LoaderApp._build_current_asm_frame
     _send_current_asm_frame = X07LoaderApp._send_current_asm_frame
+    _read_exact_bytes = X07LoaderApp._read_exact_bytes
+    _read_until_marker = X07LoaderApp._read_until_marker
+    _read_exact_with_pending = X07LoaderApp._read_exact_with_pending
+    _receive_dump_d_stream = X07LoaderApp._receive_dump_d_stream
+    _save_dump_d_entries = X07LoaderApp._save_dump_d_entries
+    _dump_ram_d_files_impl = X07LoaderApp._dump_ram_d_files_impl
     _convert_basic_to_cas_impl = X07LoaderApp._convert_basic_to_cas_impl
     _convert_cas_to_text_impl = X07LoaderApp._convert_cas_to_text_impl
     _disable_slave_mode_impl = X07LoaderApp._disable_slave_mode_impl
@@ -2897,6 +3221,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     _add_typing_args(p, settings, include_delays=True)
     _add_loader_runtime_args(p, settings, include_loader_addr=True, include_asm_addr=True)
 
+    p = subparsers.add_parser("dump-ram-d", help='Dump all RAM type D files to .ramd.bin outputs (X-07 side: LOAD"COM:" then RUN).')
+    p.add_argument("output_dir", type=Path, help="Output directory for the dumped .ramd.bin files and manifest.")
+    _add_typing_args(p, settings, include_delays=True)
+    _add_loader_runtime_args(p, settings, include_loader_addr=False, include_asm_addr=False)
+
     return parser
 
 
@@ -2937,6 +3266,8 @@ def run_cli(args) -> int:
         return runner.run("Send ASM (loader running)", runner._send_bin_only_impl)
     if args.command == "send-asm":
         return runner.run("One click: loader + ASM", runner._send_loader_and_bin_impl)
+    if args.command == "dump-ram-d":
+        return runner.run("Dump RAM type D files", lambda: runner._dump_ram_d_files_impl(args.output_dir))
 
     raise RuntimeError(f"Unknown command: {args.command}")
 
