@@ -1,0 +1,316 @@
+    include "canon_x07.inc"
+
+    .org $2000
+
+RAM_AREA_HDR_LEN      EQU 4
+RAM_FILE_HDR_LEN      EQU 14
+PROTO_VERSION         EQU 1
+STATUS_OK             EQU 0
+STATUS_WARN           EQU 1
+
+start:
+    ei
+    call startup_notice_delay
+
+    call init_ram_bounds
+    call scan_d_entries
+    call open_com
+    call tx_start_delay
+
+    ld hl,proto_preamble
+    ld de,PROTO_PREAMBLE_LEN
+    call send_block
+
+    ld hl,proto_magic
+    ld de,4
+    call send_block
+
+    ld a,PROTO_VERSION
+    call send_a
+
+    ld a,(scan_status)
+    call send_a
+
+    ld hl,(file_count)
+    call send_hl_le
+
+    call stream_d_entries
+    call exit_delay
+    jp ROM_COLD_START
+
+; ------------------------------------------------------------
+; RAM area start/end and optional 4-byte FSET area header
+; ------------------------------------------------------------
+init_ram_bounds:
+    ld hl,(SYS_RAMSTR)
+    ld (ram_start),hl
+
+    ld hl,(SYS_RAMEND)
+    ld (ram_end),hl
+
+    ld hl,(ram_start)
+    push hl
+
+    ld a,(hl)
+    cp $01
+    jr nz,.no_hdr
+    inc hl
+    ld a,(hl)
+    or a
+    jr nz,.no_hdr
+    inc hl
+    ld a,(hl)
+    or a
+    jr nz,.no_hdr
+    inc hl
+    ld a,(hl)
+    cp $0A
+    jr nz,.no_hdr
+
+    pop hl
+    ld de,RAM_AREA_HDR_LEN
+    add hl,de
+    ld (ram_start),hl
+    ret
+
+.no_hdr:
+    pop hl
+    ret
+
+; ------------------------------------------------------------
+; First pass: count type D files and detect malformed chains.
+; ------------------------------------------------------------
+scan_d_entries:
+    xor a
+    ld (scan_status),a
+
+    ld hl,0
+    ld (file_count),hl
+
+    ld hl,(ram_start)
+    ld (scan_ptr),hl
+
+.loop:
+    ld hl,(scan_ptr)
+    ld de,(ram_end)
+    call compare_hl_de
+    jr nc,.done
+
+    call read_entry_len_de
+    ld a,d
+    or e
+    jr z,.done
+
+    ld a,d
+    or a
+    jr nz,.len_ok
+    ld a,e
+    cp RAM_FILE_HDR_LEN
+    jr c,.warn
+
+.len_ok:
+    ld hl,(scan_ptr)
+    add hl,de
+    ld (next_ptr),hl
+
+    ld de,(ram_end)
+    call compare_hl_de
+    jr c,.bounds_ok
+    jr z,.bounds_ok
+    jr .warn
+
+.bounds_ok:
+    ld hl,(scan_ptr)
+    ld de,6
+    add hl,de
+    ld a,(hl)
+    cp "D"
+    jr nz,.advance
+
+    ld hl,(file_count)
+    inc hl
+    ld (file_count),hl
+
+.advance:
+    ld hl,(next_ptr)
+    ld (scan_ptr),hl
+    jr .loop
+
+.warn:
+    ld a,STATUS_WARN
+    ld (scan_status),a
+
+.done:
+    ret
+
+; ------------------------------------------------------------
+; Second pass: send each type D entry exactly as stored in RAM.
+; Wire format:
+;   "XDMP" version status count_lo count_hi
+;   repeated: addr_lo addr_hi len_lo len_hi raw_entry_bytes...
+; ------------------------------------------------------------
+stream_d_entries:
+    ld hl,(ram_start)
+    ld (scan_ptr),hl
+
+.loop:
+    ld hl,(scan_ptr)
+    ld de,(ram_end)
+    call compare_hl_de
+    jr nc,.done
+
+    call read_entry_len_de
+    ld a,d
+    or e
+    jr z,.done
+
+    ld a,d
+    or a
+    jr nz,.len_ok
+    ld a,e
+    cp RAM_FILE_HDR_LEN
+    jr c,.done
+
+.len_ok:
+    ld hl,(scan_ptr)
+    add hl,de
+    ld (next_ptr),hl
+
+    ld de,(ram_end)
+    call compare_hl_de
+    jr c,.bounds_ok
+    jr z,.bounds_ok
+    jr .done
+
+.bounds_ok:
+    ld hl,(scan_ptr)
+    ld de,6
+    add hl,de
+    ld a,(hl)
+    cp "D"
+    jr nz,.advance
+
+    ld hl,(scan_ptr)
+    call send_hl_le
+
+    call read_entry_len_de
+    push de
+    ld h,d
+    ld l,e
+    call send_hl_le
+    pop de
+
+    ld hl,(scan_ptr)
+    call send_block
+
+.advance:
+    ld hl,(next_ptr)
+    ld (scan_ptr),hl
+    jr .loop
+
+.done:
+    ret
+
+; ------------------------------------------------------------
+; Helpers
+; ------------------------------------------------------------
+open_com:
+    ld de,DEV_COM_TABLE
+    xor a
+    ld b,"B"                ; 8N2
+    ld ix,8000              ; patched by the Python tool if needed
+    ld iy,SYS_KBNTAB+8
+    call ROM_DEV_OPEN
+
+    ld de,SYS_KBNTAB+8
+    jp ROM_DEV_ASSIGN
+
+read_entry_len_de:
+    ld hl,(scan_ptr)
+    ld de,7
+    add hl,de
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    ret
+
+compare_hl_de:
+    push hl
+    or a
+    sbc hl,de
+    pop hl
+    ret
+
+send_a:
+    call ROM_DEV_PUTC
+    ret
+
+send_hl_le:
+    ld a,l
+    call send_a
+    ld a,h
+    jp send_a
+
+send_block:
+.loop:
+    ld a,d
+    or e
+    ret z
+    ld a,(hl)
+    call send_a
+    inc hl
+    dec de
+    jr .loop
+
+exit_delay:
+    ld bc,$4000
+.loop:
+    dec bc
+    ld a,b
+    or c
+    jr nz,.loop
+    ret
+
+tx_start_delay:
+    ld bc,$1000
+.loop:
+    dec bc
+    ld a,b
+    or c
+    jr nz,.loop
+    ret
+
+startup_notice_delay:
+    ld bc,$8000
+.loop:
+    dec bc
+    ld a,b
+    or c
+    jr nz,.loop
+    ret
+
+PROTO_PREAMBLE_LEN     EQU 16
+
+proto_preamble:
+    .db "UUUUUUUUUUUUUUUU"
+
+proto_magic:
+    .db "XDMP"
+
+ram_start:
+    .dw 0
+
+ram_end:
+    .dw 0
+
+scan_ptr:
+    .dw 0
+
+next_ptr:
+    .dw 0
+
+file_count:
+    .dw 0
+
+scan_status:
+    .db 0
