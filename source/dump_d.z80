@@ -96,6 +96,16 @@ scan_d_entries:
     call compare_hl_de
     jr nc,.done
 
+    call has_min_header_room
+    jr c,.room_ok
+    jr z,.room_ok
+    jr .warn
+
+.room_ok:
+    call validate_entry_header
+    jr z,.done
+    jr c,.warn
+
     call read_entry_len_de
     ld a,d
     or e
@@ -158,6 +168,16 @@ stream_d_entries:
     ld de,(ram_end)
     call compare_hl_de
     jr nc,.done
+
+    call has_min_header_room
+    jr c,.room_ok
+    jr z,.room_ok
+    jr .done
+
+.room_ok:
+    call validate_entry_header
+    jr z,.done
+    jr c,.done
 
     call read_entry_len_de
     ld a,d
@@ -239,6 +259,55 @@ compare_hl_de:
     or a
     sbc hl,de
     pop hl
+    ret
+
+has_min_header_room:
+    ld hl,(scan_ptr)
+    ld de,RAM_FILE_HDR_LEN
+    add hl,de
+    ld de,(ram_end)
+    call compare_hl_de
+    ret
+
+validate_entry_header:
+    ld hl,(scan_ptr)
+    ld a,(hl)
+    or a
+    ret z
+
+    ld b,6
+.name_loop:
+    ld a,(hl)
+    cp $20
+    jr c,.invalid
+    cp $7F
+    jr nc,.invalid
+    inc hl
+    djnz .name_loop
+
+    ld a,(hl)
+    cp "A"
+    jr c,.invalid
+    cp "Z"+1
+    jr nc,.invalid
+
+    inc hl
+    inc hl
+    inc hl
+    ld b,5
+.reserve_loop:
+    ld a,(hl)
+    or a
+    jr nz,.invalid
+    inc hl
+    djnz .reserve_loop
+
+    ld a,1
+    or a
+    ret
+
+.invalid:
+    scf
     ret
 
 send_a:
